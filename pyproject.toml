@@ -72,6 +72,12 @@ exclude = ["*.md"]
 [tool.pyright]
 include = ["credstore", "tests"]
 pythonVersion = "3.13"
+# Type-check against Windows, the platform most of the platform-specific
+# code (winreg, msvcrt, ctypes.windll, win32ctypes) targets.  The Unix-only
+# imports (_tty's termios/tty) already carry type: ignore[import-not-found],
+# the same suppression this setting would otherwise require in reverse.
+# Pinning it keeps local runs and CI identical regardless of host OS.
+pythonPlatform = "Windows"
 
 [tool.pytest.ini_options]
 minversion = "9.1"

@@ -34,7 +34,7 @@ jobs:
         run: uv run --frozen pytest -v --maxfail=5
 
   lint:
-    name: Lint and type-check
+    name: Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -53,6 +53,25 @@ jobs:
 
       - name: Ruff format
         run: uv run --frozen ruff format --check
+
+  typecheck:
+    name: Type-check
+    # Windows, not ubuntu: pyright is pinned to pythonPlatform = "Windows"
+    # (see [tool.pyright] in pyproject.toml), and winreg / msvcrt /
+    # ctypes.windll / win32ctypes only resolve there — win32ctypes is a
+    # win32-only dependency, so it is not even installed on Linux.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: uv sync --locked
 
       - name: Pyright
         run: uv run --frozen pyright
