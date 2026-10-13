@@ -30,7 +30,7 @@ Write-Host "credstore Installer" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Install method : uv tool install --force (isolated environment; re-run = update)"
 Write-Host "User data      : ~\.credstore\ (encrypted credential backup)"
-Write-Host "Python         : managed by uv"
+Write-Host "Python         : 3.13+ (managed by uv)"
 Write-Host ""
 
 # [1/2] Ensure uv is available
@@ -45,10 +45,16 @@ Write-Ok "uv $(uv --version 2>&1)"
 # [2/2] Install/update credstore from PyPI.  --force: re-running this
 # script upgrades an existing install (a plain ``uv tool install`` no-ops
 # with "already installed").
+#
+# --python is required, not cosmetic: without it uv builds the tool env on
+# whatever interpreter it prefers (often an older one it already manages)
+# and then resolves to the newest release compatible with THAT Python.
+# credstore 0.10+ needs >= 3.13, so a 3.12 tool env silently installs 0.9.0.
+# With the constraint uv fetches a suitable interpreter, or fails loudly.
 Write-Step "[2/2] Installing/updating credstore..."
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-& uv tool install --force credstore 2>&1 | Out-Null
+& uv tool install --force --python ">=3.13" credstore 2>&1 | Out-Null
 $ok = ($LASTEXITCODE -eq 0)
 $ErrorActionPreference = $prevEAP
 if (-not $ok) {

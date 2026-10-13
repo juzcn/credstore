@@ -13,10 +13,12 @@
 ```bash
 pip install credstore
 # 或在隔离环境中：
-uv tool install --force credstore
+uv tool install --force --python '>=3.13' credstore
 ```
 
-一键安装脚本（必要时先装 `uv`，再 `uv tool install --force credstore`）：
+> `--python '>=3.13'` 不是可选项。不加它，`uv` 会用自己偏好的解释器搭工具环境，然后装**该 Python 版本能装的最高版本**——在 3.12 上就是早已过时的 0.9.0，而不是当前版本。加上约束后，uv 会去取合适的解释器，取不到就明确报错。
+
+一键安装脚本（必要时先装 `uv`，再 `uv tool install --force --python '>=3.13' credstore`）：
 
 ```bash
 # macOS / Linux / WSL

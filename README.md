@@ -13,10 +13,17 @@ Requires **Python ≥ 3.13**.
 ```bash
 pip install credstore
 # or, in an isolated environment:
-uv tool install --force credstore
+uv tool install --force --python '>=3.13' credstore
 ```
 
-One-click installers (install `uv` if needed, then `uv tool install --force credstore`):
+> `--python '>=3.13'` is not optional. Without it `uv` builds the tool
+> environment on whichever interpreter it prefers and then installs the newest
+> release compatible with *that* Python — which on a 3.12 environment is the
+> long-superseded 0.9.0, not the current release. With the constraint, uv
+> fetches a suitable interpreter or fails loudly.
+
+One-click installers (install `uv` if needed, then `uv tool install --force
+--python '>=3.13' credstore`):
 
 ```bash
 # macOS / Linux / WSL

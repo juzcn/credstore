@@ -22,7 +22,7 @@ echo -e "${CYAN}credstore Installer${NC}"
 echo ""
 echo "Install method : uv tool install --force (isolated environment; re-run = update)"
 echo "User data      : ~/.credstore/ (encrypted credential backup)"
-echo "Python         : managed by uv"
+echo "Python         : 3.13+ (managed by uv)"
 echo ""
 
 # [1/2] Ensure uv is available.
@@ -36,8 +36,14 @@ echo -e "${GREEN}  ✓${NC} uv $(uv --version 2>&1)"
 # [2/2] Install/update credstore from PyPI.  --force: re-running this
 # script upgrades an existing install (a plain ``uv tool install`` no-ops
 # with "already installed").
+#
+# --python is required, not cosmetic: without it uv builds the tool env on
+# whatever interpreter it prefers (often an older one it already manages)
+# and then resolves to the newest release compatible with THAT Python.
+# credstore 0.10+ needs >= 3.13, so a 3.12 tool env silently installs 0.9.0.
+# With the constraint uv fetches a suitable interpreter, or fails loudly.
 echo -e "${YELLOW}[2/2] Installing/updating credstore…${NC}"
-if uv tool install --force credstore; then
+if uv tool install --force --python '>=3.13' credstore; then
     echo -e "${GREEN}  ✓${NC} credstore ready"
 else
     echo -e "${RED}Error: credstore installation failed.${NC}"
