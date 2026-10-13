@@ -286,7 +286,19 @@ uv run ruff format   # format
 uv run pyright       # type-check
 ```
 
-CI runs the suite on Windows, macOS, and Linux (`.github/workflows/ci.yml`), plus a lint/type-check job.
+CI runs the suite on Windows, macOS, and Linux (`.github/workflows/ci.yml`), plus lint and type-check jobs.
+
+### Releasing
+
+Bump `version` in `pyproject.toml`, commit, then push a tag with the same
+version:
+
+```bash
+git tag -a v0.10.7 -m "credstore 0.10.7" && git push origin v0.10.7
+```
+
+`.github/workflows/publish.yml` fails unless the tag matches the package
+version exactly, then uploads to PyPI via trusted publishing.
 
 ## License
 

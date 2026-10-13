@@ -276,7 +276,17 @@ uv run ruff format   # 格式化
 uv run pyright       # 类型检查
 ```
 
-CI 在 Windows、macOS、Linux 上跑测试（`.github/workflows/ci.yml`），另有独立的 lint / 类型检查任务。
+CI 在 Windows、macOS、Linux 上跑测试（`.github/workflows/ci.yml`），另有独立的 lint 和类型检查任务。
+
+### 发版
+
+改 `pyproject.toml` 里的 `version`，提交，然后推一个同名 tag：
+
+```bash
+git tag -a v0.10.7 -m "credstore 0.10.7" && git push origin v0.10.7
+```
+
+`.github/workflows/publish.yml` 会校验 tag 与包版本完全一致，不一致直接失败；通过后经 trusted publishing 上传到 PyPI。
 
 ## 许可证
 
