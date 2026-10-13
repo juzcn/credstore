@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel
+        # Packaging check — the sdist and wheel must build on every
+        # supported platform.  (pytest runs against the source tree, which
+        # is what the tests are written for.)
+        run: uv build --out-dir dist
+
+      - name: Run tests
+        run: uv run --frozen pytest -v --maxfail=5
+
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run --frozen ruff check --output-format github
+
+      - name: Ruff format
+        run: uv run --frozen ruff format --check
+
+      - name: Pyright
+        run: uv run --frozen pyright
