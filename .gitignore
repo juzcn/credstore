@@ -9,6 +9,12 @@ dist/
 .venv/
 venv/
 
+# Credential files — the default path is ~/.credstore/, but CREDSTORE_FILE
+# (or running from a checkout) can drop one in the working directory.  It
+# is an encrypted backup and must never be committed.
+credentials.crypt
+credentials.crypt.bak
+
 # Test / tool caches
 .pytest_cache/
 .ruff_cache/
