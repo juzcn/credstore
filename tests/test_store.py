@@ -1,6 +1,8 @@
 """Tests for credential store operations."""
 
+import logging
 from contextlib import contextmanager
+from typing import ClassVar
 
 import pytest
 
@@ -11,6 +13,37 @@ import credstore._store as sm
 from credstore._store import DEFAULT_SERVICE, CredentialStore, _read_cryptfile_keys
 
 from ._mocks import MockCryptfileBackend, MockKeyringBackend
+
+
+class _SealedCryptfile:
+    """A cryptfile stand-in that enforces the spelling its entries are sealed with.
+
+    Mirrors the real ``keyrings.cryptfile``: the key's original spelling is
+    bound into the entry's AEAD associated data, so a lookup under any other
+    case fails its MAC check — ``ValueError`` — instead of returning a value
+    (or a wrong one).  Absent keys return None.
+    """
+
+    def __init__(self, entries: dict[str, str]):
+        self._entries = entries
+
+    def get_password(self, service: str, username: str) -> str | None:
+        if username in self._entries:
+            return self._entries[username]
+        folded = username.lower()
+        if any(k.lower() == folded for k in self._entries):
+            raise ValueError("MAC check failed")
+        return None
+
+
+def _already_unlocked(cf):
+    """Build a stand-in for ``unlocked_cryptfile`` that yields *cf* as-is."""
+
+    @contextmanager
+    def _unlock(password):
+        yield cf
+
+    return _unlock
 
 
 class TestCredentialStore:
@@ -54,7 +87,9 @@ class TestCredentialStore:
 
         monkeypatch.setattr(
             "credstore._store._read_cryptfile_keys",
-            lambda cf: [k.split(":", 1)[1] for k in data if k.startswith("cryptfile:")],
+            lambda cf, service=DEFAULT_SERVICE: [
+                k.split(":", 1)[1] for k in data if k.startswith("cryptfile:")
+            ],
         )
 
         assert store.get("key1") is None
@@ -68,6 +103,197 @@ class TestCredentialStore:
         store, data = dual_store
         data["cryptfile:only-cf"] = "from-cf"
         assert store.get("only-cf") is None
+
+
+class TestResolveCryptfileEntry:
+    """The cryptfile cannot say how a key was spelled — lookups must recover it.
+
+    ``keyrings.cryptfile`` folds the INI option name to lower case but binds
+    the key's original spelling into the entry's AEAD associated data, so a
+    lookup with the wrong case fails its MAC check (ValueError) rather than
+    returning a wrong value.  Reading a key out of the file therefore means
+    trying the spellings that could have produced the stored option name.
+    """
+
+    def test_resolves_lowercase_sealed_entry(self):
+        """Canonical 'MYAPP/API_KEY' is found as the sealed 'myapp/api_key'."""
+        entry = sm.resolve_cryptfile_entry(
+            _SealedCryptfile({"myapp/api_key": "s3cret"}), "MYAPP/API_KEY"
+        )
+        assert entry == ("myapp/api_key", "s3cret")
+
+    def test_resolves_uppercase_sealed_entry(self):
+        """...and an upper-case entry is found from the same canonical name."""
+        entry = sm.resolve_cryptfile_entry(
+            _SealedCryptfile({"MCP_OAUTH_TOKEN": "tok"}), "MCP_OAUTH_TOKEN"
+        )
+        assert entry == ("MCP_OAUTH_TOKEN", "tok")
+
+    def test_keyring_spelling_wins(self):
+        """A mixed-case key is recoverable only from the keyring's spelling."""
+        cf = _SealedCryptfile({"myApp/ApiKey": "mixed"})
+        with pytest.raises(ValueError):
+            sm.resolve_cryptfile_entry(cf, "MYAPP/APIKEY")
+        entry = sm.resolve_cryptfile_entry(
+            cf, "MYAPP/APIKEY", spellings={"MYAPP/APIKEY": "myApp/ApiKey"}
+        )
+        assert entry == ("myApp/ApiKey", "mixed")
+
+    def test_absent_entry_returns_none(self):
+        assert sm.resolve_cryptfile_entry(_SealedCryptfile({}), "NOPE") is None
+
+    def test_unrecoverable_spelling_raises(self):
+        """An entry that exists but decrypts under no candidate must raise.
+
+        Reporting it as "absent" is what let `reset-keyring` and the
+        `set-password` change path drop credentials without a word.
+        """
+        cf = _SealedCryptfile({"myApp/ApiKey": "mixed"})
+        with pytest.raises(ValueError):
+            sm.resolve_cryptfile_entry(cf, "MYAPP/APIKEY")
+
+
+class TestResetKeepsSealedSpelling:
+    """reset() must restore under the spelling the cryptfile sealed."""
+
+    def test_reset_restores_lowercase_entry(self, dual_store, monkeypatch):
+        store, data = dual_store
+        monkeypatch.setattr(
+            be,
+            "unlocked_cryptfile",
+            _already_unlocked(_SealedCryptfile({"myapp/api_key": "s3cret"})),
+        )
+        monkeypatch.setattr(
+            sm,
+            "_read_cryptfile_keys",
+            lambda cf, service=DEFAULT_SERVICE: ["MYAPP/API_KEY"],
+        )
+        monkeypatch.setattr(
+            sm, "keyring_key_spellings", lambda service=DEFAULT_SERVICE: {}
+        )
+
+        assert store.reset("pw") == 1
+        # Restored under the sealed spelling — writing the canonical form into
+        # the keyring would leave the backup entry unreachable by that name.
+        assert data["system:myapp/api_key"] == "s3cret"
+        assert "system:MYAPP/API_KEY" not in data
+
+    def test_reset_uses_keyring_spelling_for_mixed_case(self, dual_store, monkeypatch):
+        store, data = dual_store
+        monkeypatch.setattr(
+            be,
+            "unlocked_cryptfile",
+            _already_unlocked(_SealedCryptfile({"myApp/ApiKey": "v"})),
+        )
+        monkeypatch.setattr(
+            sm,
+            "_read_cryptfile_keys",
+            lambda cf, service=DEFAULT_SERVICE: ["MYAPP/APIKEY"],
+        )
+        monkeypatch.setattr(
+            sm,
+            "keyring_key_spellings",
+            lambda service=DEFAULT_SERVICE: {"MYAPP/APIKEY": "myApp/ApiKey"},
+        )
+
+        assert store.reset("pw") == 1
+        assert data["system:myApp/ApiKey"] == "v"
+
+    @pytest.mark.parametrize(
+        "enumerable,advertises",
+        [
+            # Where the keyring can be listed, re-syncing repairs the entry.
+            (True, "reset-backup"),
+            # Where it cannot (macOS, Linux), reset-backup would enumerate
+            # nothing and sync nothing — pointing at it is a dead end.
+            (False, "credstore set"),
+        ],
+    )
+    def test_reset_reports_unreadable_entry(
+        self, dual_store, monkeypatch, caplog, enumerable, advertises
+    ):
+        """A key that cannot be read back is skipped *loudly* and with a
+        remedy that works on this platform."""
+        store, _data = dual_store
+        monkeypatch.setattr(
+            be,
+            "unlocked_cryptfile",
+            _already_unlocked(_SealedCryptfile({"myApp/ApiKey": "v"})),
+        )
+        monkeypatch.setattr(
+            sm,
+            "_read_cryptfile_keys",
+            lambda cf, service=DEFAULT_SERVICE: ["MYAPP/APIKEY"],
+        )
+        monkeypatch.setattr(
+            sm, "keyring_key_spellings", lambda service=DEFAULT_SERVICE: {}
+        )
+        monkeypatch.setattr(
+            "credstore._enumerate.enumeration_supported", lambda: enumerable
+        )
+
+        with caplog.at_level(logging.WARNING, logger="credstore"):
+            assert store.reset("pw") == 0
+        assert "reset_skip" in caplog.text
+        assert advertises in caplog.text
+
+
+@pytest.mark.integration
+class TestResetAgainstRealCryptfile:
+    """The real encrypted file is what loses the key's case — test against it.
+
+    ``reset-keyring`` is the disaster-recovery command (the system keyring
+    was wiped, the backup is all that is left), so the file's case handling
+    has to hold for the library that actually writes it, not just a mock.
+    """
+
+    KEYS: ClassVar[dict[str, str]] = {
+        "myapp/api_key": "secret-lower",
+        "MCP_OAUTH_TOKEN": "secret-upper",
+        "gh/cli-token": "secret-slash",
+    }
+
+    def _sealed_cryptfile(self, tmp_path):
+        from keyrings.cryptfile.cryptfile import CryptFileKeyring
+
+        cf = CryptFileKeyring()
+        # file_path is a read-only NonDataProperty on the class; an instance
+        # attribute shadows it (same assignment as _backend._init_cryptfile).
+        cf.file_path = str(tmp_path / "credentials.crypt")  # type: ignore[assignment]
+        cf.keyring_key = "master-password"
+        for key, secret in self.KEYS.items():
+            cf.set_password(DEFAULT_SERVICE, key, secret)
+        return cf
+
+    def test_reset_restores_every_key_under_its_own_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        cf = self._sealed_cryptfile(tmp_path)
+
+        restored: dict[str, str] = {}
+
+        class _WipedKeyring:
+            """A keyring that lost its values — the case reset-keyring exists for."""
+
+            def get_password(self, service, username):
+                return None
+
+            def set_password(self, service, username, password):
+                restored[username] = password
+
+        monkeypatch.setattr(be, "get_system_keyring", lambda: _WipedKeyring())
+        monkeypatch.setattr(be, "unlocked_cryptfile", _already_unlocked(cf))
+        monkeypatch.setattr(
+            sm, "keyring_key_spellings", lambda service=DEFAULT_SERVICE: {}
+        )
+
+        store = CredentialStore()
+        monkeypatch.setattr(sm, "_get_store", lambda: store)
+
+        # Every credential comes back — a name read out of the file is
+        # canonicalised, so a lookup has to recover the sealed spelling.
+        assert store.reset("master-password") == len(self.KEYS)
+        assert restored == self.KEYS
 
 
 class TestMask:

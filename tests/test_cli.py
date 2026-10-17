@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from credstore.__main__ import main
+from credstore.__main__ import _classify_credential_row, main
 
 pytestmark = pytest.mark.unit
 
@@ -35,7 +35,6 @@ class TestTtyGuards:
         ["set", "test/key"],
         ["get", "test/key"],
         ["get", "--password", "test/key"],
-        ["remove", "test/key"],
         [],
         ["reset-keyring"],
         ["reset-backup"],
@@ -50,9 +49,27 @@ class TestTtyGuards:
         assert main(argv) == 1
 
     def test_status_allows_non_tty(self, mock_backend, monkeypatch):
-        """status is the only command that works without a tty."""
+        """status needs no tty."""
         monkeypatch.setattr(sys, "stdin", StringIO(""))
         assert main(["status"]) == 0
+
+    def test_remove_allows_non_tty(
+        self, capsys, mock_backend, in_mem_store, monkeypatch
+    ):
+        """A script can remove the keyring copy; only the backup cleanup waits.
+
+        The cryptfile half needs the master password, so it is skipped with a
+        notice instead of blocking the whole command — the keyring copy is
+        removed regardless (what the README promises).
+        """
+        monkeypatch.setattr(sys, "stdin", StringIO(""))  # not a tty
+        in_mem_store["test/key"] = "secret"
+
+        assert main(["remove", "test/key"]) == 0
+        assert "test/key" not in in_mem_store
+        out, err = capsys.readouterr()
+        assert "Deleted from system keyring" in out
+        assert "cryptfile cleanup needs an interactive terminal" in err
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -382,6 +399,113 @@ class TestCliDelete:
         assert "Deleted: test/key" in out
         assert "Warning" not in err
 
+    def test_delete_without_any_backup_does_not_prompt(
+        self, capsys, mock_backend, in_mem_store, monkeypatch
+    ):
+        """No cryptfile configured → no master-password prompt, no bogus warning.
+
+        Prompting would be worse than useless: unlocking a cryptfile that does
+        not exist *creates* it, keyed to whatever was typed (see
+        _backend.unlocked_cryptfile).
+        """
+        import credstore._backend as backend
+
+        monkeypatch.setattr(backend, "has_master_key", lambda: False)
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input",
+            lambda prompt="": pytest.fail("must not prompt without a cryptfile"),
+        )
+        in_mem_store["test/key"] = "secret"
+
+        assert main(["remove", "test/key"]) == 0
+        out, err = capsys.readouterr()
+        assert "Deleted from system keyring: test/key" in out
+        assert "no encrypted backup" in err
+        assert "remains in the encrypted backup" not in err
+
+    def test_delete_cryptfile_only_mode_does_not_warn_about_keyring(
+        self, capsys, mock_backend_no_keyring, in_mem_cryptfile, monkeypatch
+    ):
+        """Cryptfile-only: the backup copy is gone and there is no keyring copy.
+
+        The old wording claimed the credential "remains in the system keyring"
+        — there is no system keyring on that platform, and 'reset-backup'
+        cannot enumerate one there either.
+        """
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "test-master-pw"
+        )
+        in_mem_cryptfile["test/key"] = "secret"
+
+        assert main(["remove", "test/key"]) == 0
+        out, err = capsys.readouterr()
+        assert "Deleted from encrypted backup" in out
+        assert "remains in the system keyring" not in err
+
+
+# ═══════════════════════════════════════════════════════════════
+# copy
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.usefixtures("_tty")
+class TestCliCopy:
+    def _inputs(self, monkeypatch, *values):
+        it = iter(values)
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": next(it)
+        )
+        # Keep the host's real environment out of it: is_injected() reads the
+        # Windows registry, and a True would make copy write to it.
+        monkeypatch.setattr("credstore.__main__.is_injected", lambda key: False)
+
+    def test_copy_writes_both_stores(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        self._inputs(monkeypatch, "master-pw")
+        in_mem_store["src/key"] = "sk-value"
+
+        assert main(["copy", "src/key", "dst/key"]) == 0
+        assert in_mem_store["dst/key"] == "sk-value"
+        assert in_mem_cryptfile["dst/key"] == "sk-value"
+
+    def test_copy_already_synced_in_both_stores(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """Both stores match → no-op, reported as such."""
+        self._inputs(monkeypatch, "master-pw")
+        in_mem_store["src/key"] = "sk-value"
+        in_mem_store["dst/key"] = "sk-value"
+        in_mem_cryptfile["dst/key"] = "sk-value"
+
+        assert main(["copy", "src/key", "dst/key"]) == 0
+        assert "Already synced" in capsys.readouterr().out
+
+    def test_copy_repairs_keyring_only_destination(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """Present in the keyring but missing from the backup → repair it.
+
+        Declaring "Already synced" from the keyring alone left the encrypted
+        backup — the copy this command exists to make — without the entry,
+        so `reset-keyring` had nothing to restore from.
+        """
+        self._inputs(monkeypatch, "master-pw")
+        in_mem_store["src/key"] = "sk-value"
+        in_mem_store["dst/key"] = "sk-value"
+
+        assert main(["copy", "src/key", "dst/key"]) == 0
+        assert in_mem_cryptfile["dst/key"] == "sk-value"
+        assert "Already synced" not in capsys.readouterr().out
+
+    def test_copy_rejects_same_source_and_dest(self, mock_backend, monkeypatch):
+        self._inputs(monkeypatch)
+        assert main(["copy", "src/key", "src/key"]) == 1
+
+    def test_copy_source_missing(self, mock_backend, monkeypatch):
+        self._inputs(monkeypatch)
+        assert main(["copy", "nope/key", "dst/key"]) == 1
+
 
 # ═══════════════════════════════════════════════════════════════
 # list
@@ -390,6 +514,22 @@ class TestCliDelete:
 
 @pytest.mark.usefixtures("_tty")
 class TestCliList:
+    def test_unreadable_backup_entry_is_a_mismatch_not_a_crash(self):
+        """A backup entry sealed under an unrecoverable spelling cannot abort
+        the whole listing.
+
+        The key is present in cryptfile_keys, so the row has to say something
+        about it: the two stores have diverged (that entry is unreachable
+        under the keyring's name), which is what MISMATCH reports.
+        """
+
+        class _UnreadableCryptfile:
+            def get_password(self, service, username):
+                raise ValueError("MAC check failed")
+
+        marks = _classify_credential_row("KEY", True, True, _UnreadableCryptfile())
+        assert marks == ("✔", "✔", "MISMATCH ⚠", "mismatched")
+
     def test_list_empty(self, capsys, mock_backend, in_mem_cryptfile, monkeypatch):
         monkeypatch.setattr(
             "credstore.__main__.masked_input", lambda prompt="": "master-pw"
@@ -492,6 +632,28 @@ class TestCliList:
         assert main([]) == 0
         out = capsys.readouterr().out
         assert "reset-keyring" in out
+
+    def test_list_without_keyring_enumeration(
+        self, capsys, mock_backend, in_mem_cryptfile, monkeypatch
+    ):
+        """No list API for the keyring (macOS, Linux) → say so, don't guess.
+
+        Reporting "cryptfile only" for every credential claimed something
+        about a store that was never read, and nagged the user to run
+        `reset-keyring` for credentials that were never missing.
+        """
+        monkeypatch.setattr("credstore.__main__.enumeration_supported", lambda: False)
+        in_mem_cryptfile["svc/k1"] = "v1"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main([]) == 0
+        out = capsys.readouterr().out
+        assert "in backup" in out
+        assert "cryptfile only" not in out
+        assert "reset-keyring" not in out
+        assert "cannot be listed on this platform" in out
 
     def test_list_lowercase_key_synced_single_row(
         self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch

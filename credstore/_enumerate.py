@@ -6,9 +6,10 @@ with inline C# P/Invoke to ``advapi32.dll CredEnumerateW``.  Other
 platforms return an empty list.
 
 Memory safety: pass ``with_values=False`` (the default) to enumerate
-keys only — secret values are never decoded or stored.  Only set
-``with_values=True`` when you genuinely need all values (e.g. syncing
-to cryptfile backup).
+keys only — secret values are never decoded or stored, and on WSL the
+PowerShell bridge is told not to read the credential blobs at all, so
+they never leave Credential Manager.  Only set ``with_values=True``
+when you genuinely need all values (e.g. syncing to cryptfile backup).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import sys
 
 from credstore._platform import is_wsl
 
-__all__ = ["enumerate_system_keyring"]
+__all__ = ["enumerate_system_keyring", "enumeration_supported"]
 
 
 # ── WSL detection ───────────────────────────────────────────────────
@@ -55,7 +56,7 @@ public class CredEnum {
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern void CredFree(IntPtr buffer);
 
-    public static string EnumerateCredentials(string serviceSuffix) {
+    public static string EnumerateCredentials(string serviceSuffix, bool withValues) {
         int count;
         IntPtr buf;
         if (!CredEnumerateW(null, 0, out count, out buf)) {
@@ -72,8 +73,11 @@ public class CredEnum {
             string target = Marshal.PtrToStringUni(cred.TargetName) ?? "";
             if (user.Length == 0) continue;
             if (target != serviceSuffix && !target.EndsWith("@" + serviceSuffix)) continue;
+            // withValues is false for a plain listing: the blob is left where
+            // it is, so no secret is ever copied into this process, encoded,
+            // or piped back to the caller.
             string blobStr = "";
-            if (cred.CredentialBlobSize > 0) {
+            if (withValues && cred.CredentialBlobSize > 0) {
                 byte[] bytes = new byte[cred.CredentialBlobSize];
                 Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize);
                 blobStr = Convert.ToBase64String(bytes);
@@ -86,14 +90,21 @@ public class CredEnum {
 }
 "@
 
-$svc = [Console]::In.ReadToEnd().Trim()
-$json = [CredEnum]::EnumerateCredentials($svc)
+$svc = [Console]::In.ReadLine()
+$flag = [Console]::In.ReadLine()
+$json = [CredEnum]::EnumerateCredentials($svc, ($flag -eq "1"))
 Write-Output $json
 """
 
 
 def _enumerate_wsl(service: str, with_values: bool = False) -> list[tuple[str, str]]:
-    """Enumerate credstore credentials via PowerShell CredEnumerate on WSL."""
+    """Enumerate credstore credentials via PowerShell CredEnumerate on WSL.
+
+    With *with_values* False (the default) the bridge returns key names only:
+    the script is told not to read the credential blobs at all, so the secrets
+    are never encoded into the child's stdout — and therefore never enter this
+    process's memory — just to be discarded here.
+    """
     import json
 
     try:
@@ -108,7 +119,7 @@ def _enumerate_wsl(service: str, with_values: bool = False) -> list[tuple[str, s
                 "-EncodedCommand",
                 encoded_script,
             ],
-            input=service,
+            input=f"{service}\n{1 if with_values else 0}\n",
             check=False,  # nonzero exit is handled below, not raised
             capture_output=True,
             encoding="utf-8",
@@ -178,6 +189,18 @@ def _decode_blob(blob: bytes) -> str | None:
 
 
 # ── public API ──────────────────────────────────────────────────────
+
+
+def enumeration_supported() -> bool:
+    """Whether the system keyring can be enumerated on this platform.
+
+    Windows and WSL read Credential Manager directly; the macOS Keychain and
+    the Linux kernel keyring expose no list API at all, so there callers must
+    distinguish "the keyring is empty" from "the keyring cannot be listed" —
+    e.g. a recovery message that suggests rebuilding from the keyring is only
+    actionable where the keyring can be read back.
+    """
+    return os.name == "nt" or is_wsl()
 
 
 def enumerate_system_keyring(

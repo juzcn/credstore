@@ -122,29 +122,51 @@ class CredentialStore:
         """Restore all credentials from cryptfile to system keyring.
 
         Reads every credential from the encrypted cryptfile using
-        *master_password*, then writes each one to the system keyring.
-        Returns the count of restored credentials.
+        *master_password*, then writes each one to the system keyring —
+        under the spelling the entry is sealed with, which is also the
+        spelling to restore it under.  Returns the count of restored
+        credentials; an entry that cannot be read is skipped with a warning
+        rather than silently dropped.
         """
         sk = _be.get_system_keyring()
         if sk is None:
             raise RuntimeError("No system keyring available")
 
+        # Where the keyring can be read back, a skipped entry can be repaired
+        # by re-syncing it; where it cannot (macOS, Linux), the only way out is
+        # to re-set the credential under the spelling it was stored with.
+        from credstore._enumerate import enumeration_supported
+
+        unreadable_hint = (
+            "run 'credstore reset-backup' to rewrite it from the keyring"
+            if enumeration_supported()
+            else "the file cannot show its original spelling — re-set it with "
+            "'credstore set <KEY>'"
+        )
+
+        spellings = keyring_key_spellings(self._service)
         with _be.unlocked_cryptfile(master_password) as cf:
-            keys = _read_cryptfile_keys(cf)
+            keys = _read_cryptfile_keys(cf, self._service)
             count = 0
             for key in keys:
                 try:
-                    value = cf.get_password(self._service, key)
-                    if value is not None:
-                        sk.set_password(self._service, key, value)
+                    entry = resolve_cryptfile_entry(cf, key, self._service, spellings)
+                    if entry is not None:
+                        name, value = entry
+                        sk.set_password(self._service, name, value)
                         count += 1
-                        logger.info("reset_restored key=%s", key)
+                        logger.info("reset_restored key=%s", name)
                         del value  # release secret after write
                 except Exception as exc:  # noqa: BLE001 — one bad key must not abort the restore
                     # Keyrings and the cryptfile layer raise from several
                     # families (KeyringError, OSError, RuntimeError on a
                     # decrypt failure), so this deliberately catches broadly.
-                    logger.warning("reset_skip key=%s err=%s", key, exc)
+                    logger.warning(
+                        "reset_skip key=%s err=%s — not restored: %s",
+                        key,
+                        exc,
+                        unreadable_hint,
+                    )
 
             logger.info("reset_complete count=%d", count)
             return count
@@ -169,9 +191,20 @@ class CredentialStore:
 # ── helpers ──────────────────────────────────────────────────
 
 
-def _read_cryptfile_keys(cf) -> list[str]:
-    """Read all credential keys from a cryptfile INI file."""
+def _read_cryptfile_keys(cf, service: str = DEFAULT_SERVICE) -> list[str]:
+    """Read all credential keys from a cryptfile INI file.
+
+    Names come back canonically cased (upper).  The file cannot do better:
+    ``keyrings.cryptfile`` escapes a key into the INI option name (``/`` →
+    ``_2F``) and configparser then folds that name to lower case, while the
+    key's *original* spelling is sealed into the entry's AEAD associated data.
+    ``myapp/api_key`` and ``MYAPP/API_KEY`` are therefore indistinguishable
+    here — pass these canonical names to ``resolve_cryptfile_entry``, which
+    recovers the sealed spelling, never straight to ``get_password``.
+    """
     import configparser
+
+    from keyrings.cryptfile.escape import escape, unescape
 
     cfg = configparser.ConfigParser()
     cfg.read(cf.file_path)
@@ -179,15 +212,78 @@ def _read_cryptfile_keys(cf) -> list[str]:
     for section in cfg.sections():
         if section.startswith(("keyring", "DEFAULT")):
             continue
-        if section == DEFAULT_SERVICE:
-            from keyrings.cryptfile.escape import unescape
-
+        # Sections are escaped as well — but, unlike option names, not folded.
+        if section == escape(service):
             for raw_key in cfg.options(section):
-                # configparser's optionxform lowercases keys.
-                # unescape reverses _XX hex encoding → original UTF-8 bytes.
-                # Normalize to uppercase to match keyring convention.
                 keys.append(unescape(raw_key).upper())
     return keys
+
+
+def keyring_key_spellings(service: str = DEFAULT_SERVICE) -> dict[str, str]:
+    """Map canonical key names to the spelling the system keyring holds.
+
+    This is the only way to recover a *mixed-case* key (``myApp/ApiKey``): the
+    cryptfile stores a lower-cased option name, so the original spelling is
+    nowhere in the file.  Only Windows and WSL can enumerate Credential
+    Manager (see ``_enumerate.enumeration_supported``), so this is empty on
+    macOS and Linux, where callers fall back to plain case variants.
+    """
+    from credstore._enumerate import enumerate_system_keyring, enumeration_supported
+
+    if not enumeration_supported():
+        return {}
+
+    try:
+        entries = enumerate_system_keyring(service, with_values=False)
+    except Exception:
+        # A failed enumeration is not fatal — it only means the exact spelling
+        # of a mixed-case key is unknown, and the case variants are tried.
+        logger.debug("could not enumerate keyring for key spellings", exc_info=True)
+        return {}
+    return {name.upper(): name for name, _value in entries}
+
+
+def resolve_cryptfile_entry(
+    cf,
+    key: str,
+    service: str = DEFAULT_SERVICE,
+    spellings: dict[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """Read one cryptfile entry by its canonical *key*.
+
+    Returns ``(name, value)``, where *name* is the spelling the entry is
+    actually sealed under, or ``None`` when the entry is absent.  Raises
+    ``ValueError`` when the entry exists but none of the candidate spellings
+    match its associated data — the caller must report that, and must NOT read
+    it as "no such credential": the value is still there, just not reachable
+    under the name recovered from the file.
+
+    *spellings* is the optional map from ``keyring_key_spellings``; when the
+    keyring's own spelling is known it is tried first and is authoritative.
+    Every candidate resolves to the same INI option name, so a candidate can
+    only fail by MAC check (wrong spelling), never by returning a wrong secret.
+    """
+    candidates: list[str] = []
+    exact = (spellings or {}).get(key)
+    if exact:
+        candidates.append(exact)
+    for candidate in (key, key.lower()):
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    error: ValueError | None = None
+    for name in candidates:
+        try:
+            value = cf.get_password(service, name)
+        except ValueError as exc:  # sealed under a different spelling
+            error = exc
+            continue
+        if value is not None:
+            return name, value
+
+    if error is not None:
+        raise error
+    return None
 
 
 # ── module-level API ─────────────────────────────────────────

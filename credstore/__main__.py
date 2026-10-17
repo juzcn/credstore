@@ -38,6 +38,7 @@ from credstore import _backend as backend_mod
 from credstore import _config as config_mod
 from credstore import _store as store_mod
 from credstore._enumerate import enumerate_system_keyring as _enumerate_system_keyring
+from credstore._enumerate import enumeration_supported
 from credstore._shell import (
     format_export,
     format_unset,
@@ -62,7 +63,11 @@ def requires_tty(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not sys.stdin.isatty():
-            cmd = func.__name__.replace("_cmd_", "")
+            # Subcommand names are dashed on the command line ("set-password"),
+            # but the handler's suffix is underscored ("_cmd_set_password") —
+            # without the second replace the user was told to run the
+            # non-existent "credstore set_password".
+            cmd = func.__name__.replace("_cmd_", "").replace("_", "-")
             # _cmd_list is the bare-command default — no subcommand to name.
             shown = "credstore" if cmd == "list" else f"credstore {cmd}"
             _err(f"'{shown}' requires an interactive terminal.")
@@ -212,34 +217,69 @@ def main(argv: list[str] | None = None) -> int:
 def _read_old_cryptfile_data() -> dict[str, str]:
     """Unlock existing cryptfile with the user's old password.
 
-    Reads all stored credentials into a dict.  Returns empty dict if
-    the cryptfile exists but has no entries.  Raises ``ValueError`` on
-    wrong password; raises ``RuntimeError`` if the cryptfile backend
-    is not available.
+    Reads all stored credentials into a dict, keyed by the spelling each
+    entry is sealed with (so re-encrypting under the new password keeps
+    them readable).  Returns empty dict if the cryptfile exists but has no
+    entries.  Raises ``ValueError`` on wrong password; raises
+    ``RuntimeError`` if the cryptfile backend is not available.
+
+    An entry that cannot be read back is reported on stderr as it is
+    skipped — dropping it silently would quietly shrink the backup.
     """
     backend_mod.init_backend()
     cf = backend_mod.get_cryptfile()
     if cf is None:
         raise RuntimeError("cryptfile backend not available")
 
+    spellings = store_mod.keyring_key_spellings(store_mod.DEFAULT_SERVICE)
     old_pw = masked_input("Current master password: ")
+    skipped: list[str] = []
     try:
         with backend_mod.unlocked_cryptfile(old_pw) as cf_ctx:
             keys = store_mod._read_cryptfile_keys(cf_ctx)
             data: dict[str, str] = {}
             for key in keys:
                 try:
-                    value = cf_ctx.get_password(store_mod.DEFAULT_SERVICE, key)
-                except Exception:  # noqa: BLE001, S112 — unreadable key, skip it
+                    entry = store_mod.resolve_cryptfile_entry(
+                        cf_ctx, key, store_mod.DEFAULT_SERVICE, spellings
+                    )
+                except Exception:  # noqa: BLE001 — unreadable key, skip it
                     # Any failure reading one key means it simply is not
                     # carried over; the rest of the store still is.
+                    skipped.append(key)
                     continue
-                if value is not None:
-                    data[key] = value
+                if entry is not None:
+                    name, value = entry
+                    data[name] = value
     except Exception:  # noqa: BLE001 — normalize any failure to "bad password"
         del old_pw
         raise ValueError("incorrect password or corrupted file")
     del old_pw
+
+    if skipped:
+        print(
+            f"Warning: {len(skipped)} credential(s) could not be read back "
+            f"from the existing backup: {', '.join(skipped)}",
+            file=sys.stderr,
+        )
+        print(
+            "  The file folds key names to lower case, so an entry that does "
+            "not decrypt under the spellings that could have produced it "
+            "cannot be read back — it is NOT carried into the new backup.",
+            file=sys.stderr,
+        )
+        print(
+            f"  The old file is kept as {config_mod.get_cryptfile_path()}.bak — "
+            + (
+                "run 'credstore reset-backup' once the new password is set to "
+                "put them back from the system keyring."
+                if enumeration_supported()
+                else "it still opens with the old password, so re-run "
+                "'credstore set <KEY>' for these keys under the spelling they "
+                "were stored with."
+            ),
+            file=sys.stderr,
+        )
     return data
 
 
@@ -457,6 +497,14 @@ def _cmd_get(key: str, password_mode: bool = False) -> int:
         return 0
 
     # -- Password mode: dual-query with consistency check --
+    # No backup to compare against.  Checked before prompting: the master
+    # password would be asked for nothing, and unlocking a missing cryptfile
+    # creates it (see _backend.unlocked_cryptfile).
+    if not backend_mod.has_master_key():
+        _err("no encrypted backup yet — there is nothing to compare against.")
+        print("Run 'credstore set-password' first.", file=sys.stderr)
+        return 1
+
     master_pw = masked_input("Master password: ")
     if not master_pw.strip():
         del master_pw
@@ -515,8 +563,14 @@ def _cmd_get(key: str, password_mode: bool = False) -> int:
             else f"{key} — found in system keyring but missing from cryptfile backup."
         )
         _err(msg)
+        # Only point at reset-backup where the keyring can be enumerated —
+        # on macOS/Linux it would find nothing and sync nothing.
         print(
-            "Run 'credstore reset-backup' to sync keyring → cryptfile.", file=sys.stderr
+            "Run 'credstore reset-backup' to sync keyring → cryptfile."
+            if enumeration_supported()
+            else "The backup cannot be listed on this platform — re-store the "
+            "credential with 'credstore set' to write it into the backup.",
+            file=sys.stderr,
         )
         return 1
 
@@ -632,18 +686,44 @@ def _print_inject_activation(shell: str, key: str) -> None:
 # ── cryptfile helpers (CLI layer — master key is only typed here) ───
 
 
+def _cryptfile_holds(cf, key: str, secret: str) -> bool:
+    """Whether an unlocked cryptfile already stores *secret* under *key*.
+
+    An entry sealed under a different spelling of the key cannot be read back
+    under this one — the AEAD associated data binds the original name — and
+    that counts as "no usable copy", so the caller rewrites it instead of
+    skipping the write.
+    """
+    try:
+        stored = cf.get_password(store_mod.DEFAULT_SERVICE, key)
+    except ValueError:
+        return False
+    matched = stored is not None and stored == secret
+    del stored
+    return matched
+
+
 def _delete_from_cryptfile(key: str) -> str:
     """Remove a single credential from the cryptfile.
 
     Prompts for the master password, then verifies the backup no longer
     contains *key* — deleting it if present.  Returns ``"removed"`` when a
     copy was deleted, ``"absent"`` when the backup had no copy (nothing to
-    do), and ``"failed"`` when the master password was wrong, the cryptfile
-    is unavailable, or the terminal is non-interactive.
+    do), ``"unavailable"`` when there is no cryptfile to clean up (none
+    configured, or no master password set yet), ``"skipped"`` when the
+    terminal is non-interactive (so the master password cannot be read), and
+    ``"failed"`` when the master password was wrong or the cryptfile could
+    not be read.
     """
     cf = backend_mod.get_cryptfile()
     if cf is None:
-        return "failed"
+        return "unavailable"
+
+    # Nothing to clean up — and asking for a master password here would be
+    # worse than pointless: unlocking a missing cryptfile creates it (see
+    # _backend.unlocked_cryptfile), keyed to whatever the user typed.
+    if not backend_mod.has_master_key():
+        return "unavailable"
 
     if not sys.stdin.isatty():
         print(
@@ -651,7 +731,7 @@ def _delete_from_cryptfile(key: str) -> str:
             " re-run 'credstore remove' in a terminal to clean up)",
             file=sys.stderr,
         )
-        return "failed"
+        return "skipped"
 
     master_pw = masked_input("Master password (to remove from encrypted backup): ")
 
@@ -677,37 +757,58 @@ def _delete_from_cryptfile(key: str) -> str:
         del master_pw
 
 
-@requires_tty
 def _cmd_remove(key: str) -> int:
     """Remove a credential from system keyring + cryptfile.
 
-    Both removals are best-effort and independent; when only one copy
-    could be removed the remaining copy is reported explicitly so the
+    Not gated on a TTY: the keyring copy is removed regardless, and the
+    cryptfile copy only needs the master password — a piped shell gets the
+    keyring removal plus a notice that the backup copy still needs a
+    terminal.  Both removals are best-effort and independent; when only one
+    copy could be removed the remaining copy is reported explicitly so the
     user is not left believing the credential is fully gone.
     """
+    keyring_available = backend_mod.get_system_keyring() is not None
     deleted_sk = store_mod.delete_credential(key)
-    cf_state = _delete_from_cryptfile(key)  # "removed" | "absent" | "failed"
+    # removed|absent|unavailable|skipped|failed
+    cf_state = _delete_from_cryptfile(key)
 
     if deleted_sk:
-        if cf_state != "failed":
+        if cf_state in ("removed", "absent"):
             print(f"Deleted: {key}")
-        else:
+        elif cf_state == "unavailable":
             print(f"Deleted from system keyring: {key}")
             print(
-                f"Warning: '{key}' remains in the encrypted backup (missing "
-                "or incorrect master password). Re-run 'credstore remove' in "
-                "a terminal to finish.",
+                "  (no encrypted backup to clean up — run 'credstore "
+                "set-password' to create one)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Deleted from system keyring: {key}")
+            reason = (
+                "cryptfile cleanup needs an interactive terminal"
+                if cf_state == "skipped"
+                else "missing or incorrect master password"
+            )
+            print(
+                f"Warning: '{key}' remains in the encrypted backup ({reason}). "
+                "Re-run 'credstore remove' in a terminal to finish.",
                 file=sys.stderr,
             )
         return 0
     if cf_state == "removed":
         print(f"Deleted from encrypted backup: {key}")
-        print(
-            f"Warning: '{key}' remains in the system keyring and could "
-            "not be removed. It will be re-synced back into the backup "
-            "by 'credstore reset-backup'.",
-            file=sys.stderr,
-        )
+        # Only warn about a leftover keyring copy when there IS a keyring.
+        # In cryptfile-only mode (no system keyring at all) the warning was
+        # false twice over: there is no keyring copy, and 'reset-backup'
+        # cannot sync one back because it enumerates nothing on those
+        # platforms.
+        if keyring_available:
+            print(
+                f"Warning: '{key}' remains in the system keyring and could "
+                "not be removed. It will be re-synced back into the backup "
+                "by 'credstore reset-backup'.",
+                file=sys.stderr,
+            )
         return 0
     print(f"Not found: {key}")
     return 1
@@ -717,8 +818,10 @@ def _cmd_remove(key: str) -> int:
 def _cmd_copy(source: str, dest: str) -> int:
     """Copy a credential from *source* to *dest* (dual-write, idempotent).
 
-    Idempotent: if *dest* already holds the same value as *source*,
-    the operation is a no-op and returns success immediately.
+    Idempotent: if *dest* already holds the same value as *source* in
+    **both** stores, the operation is a no-op and returns success — the
+    master password is still needed to establish that, since only the
+    cryptfile can say whether the backup has a usable copy.
 
     If *dest* was previously injected into the system environment
     (``credstore inject``), the new value is re-injected so all three
@@ -758,27 +861,36 @@ def _cmd_copy(source: str, dest: str) -> int:
             )
             return 1
 
-    # 2. Idempotency: skip if dest already holds the same value
-    dest_existing = store_mod.get_credential(dest)
-    if dest_existing is not None and dest_existing == secret:
-        del dest_existing
-        del secret
-        print(f"Already synced: '{dest}' matches '{source}'.")
-        return 0
-    del dest_existing
-
     print(f"Copying '{source}' → '{dest}'")
     master_pw = masked_input("Master password (for encrypted backup): ")
 
-    # 3. Write cryptfile first (backup)
+    # 2 + 3. Write the cryptfile first (backup), and decide idempotency from
+    # BOTH stores.  The keyring alone is not enough: a credential can be
+    # present in the keyring and absent from the backup (a `set` whose
+    # cryptfile entry was later lost, or one the backup cannot read back), and
+    # answering "Already synced" then would silently skip the encrypted copy
+    # this command exists to create.
+    already_synced = False
     try:
         with backend_mod.unlocked_cryptfile(master_pw) as cf:
-            cf.set_password(store_mod.DEFAULT_SERVICE, dest, secret)
+            dest_in_keyring = store_mod.get_credential(dest)
+            if dest_in_keyring is not None and dest_in_keyring == secret:
+                already_synced = _cryptfile_holds(cf, dest, secret)
+            del dest_in_keyring
+
+            if not already_synced:
+                cf.set_password(store_mod.DEFAULT_SERVICE, dest, secret)
     except ValueError as exc:
         del secret
         del master_pw
         _err(str(exc))
         return 1
+
+    if already_synced:
+        del secret
+        del master_pw
+        print(f"Already synced: '{dest}' matches '{source}' in both stores.")
+        return 0
 
     # 4. Write system keyring (primary) — skip if unavailable (cryptfile-only)
     if backend_mod.get_system_keyring() is None:
@@ -830,10 +942,16 @@ def _cmd_list() -> int:
     each known credential key.  The ENV column shows whether the key is
     currently set as an environment variable.
 
+    Where the keyring cannot be enumerated (macOS, Linux) the keyring column
+    is reported as unknown — the keys then come from the backup and the env,
+    and no verdict about the pair of stores is possible.
+
     Memory-safe: collects only KEY names, never batch-loads secret
     values.  For sync comparison, retrieves values one at a time
     and immediately ``del``-s each after comparison.
     """
+    enumerable = enumeration_supported()
+
     # ── 1. System keyring keys only (no values) ─────────────────
     keyring_keys: set[str] = set()
     entries = _enumerate_system_keyring(store_mod.DEFAULT_SERVICE, with_values=False)
@@ -904,6 +1022,7 @@ def _cmd_list() -> int:
                     env_keys,
                     cryptfile_exists,
                     cf_ctx,
+                    enumerable,
                 )
         else:
             _print_credential_table_safe(
@@ -913,6 +1032,7 @@ def _cmd_list() -> int:
                 env_keys,
                 cryptfile_exists,
                 None,
+                enumerable,
             )
     finally:
         if master_pw is not None:
@@ -942,16 +1062,32 @@ def _classify_credential_row(
     in_ring: bool,
     in_crypt: bool,
     cf_ctx,  # unlocked cryptfile or None
+    enumerable: bool = True,
 ):
     """Compare a single credential across stores and classify its sync status.
 
     Returns ``(ring_mark, crypt_mark, status, delta)`` where *delta* is
-    one of ``("synced", "ring_only", "crypt_only", "mismatched")``.
+    one of ``("synced", "ring_only", "crypt_only", "mismatched", "unknown")``.
     Caller updates aggregate counters from *delta*.
+
+    *enumerable* is False on platforms whose keyring has no list API (macOS,
+    Linux): membership there is unknowable, so no verdict about the pair can
+    be given.
 
     Memory-safe: retrieves at most one value per store, compares,
     and ``del``-s immediately.
     """
+    if not enumerable:
+        # Nothing can be said about the keyring's side: it cannot be listed,
+        # so "cryptfile only" — which is what every row used to say there —
+        # would be a claim about a store nobody looked at, and it sent the
+        # user to `reset-keyring` for credentials that were never missing.
+        return (
+            ("?", "✔", "in backup", "unknown")
+            if in_crypt
+            else ("?", "—", "unknown", "unknown")
+        )
+
     if not (in_ring and in_crypt):
         # Present in only one store — no comparison needed.  Neither can be
         # "synced" here: that verdict needs a value from both stores.
@@ -962,11 +1098,21 @@ def _classify_credential_row(
         )
 
     ring_val = store_mod.get_credential(key)
-    crypt_val = (
-        cf_ctx.get_password(store_mod.DEFAULT_SERVICE, key)
-        if cf_ctx is not None
-        else None
-    )
+    try:
+        crypt_val = (
+            cf_ctx.get_password(store_mod.DEFAULT_SERVICE, key)
+            if cf_ctx is not None
+            else None
+        )
+    except ValueError:
+        # The key IS in cryptfile_keys, so the entry exists — but it is sealed
+        # under a different spelling of the key, and the value cannot be read
+        # back under this one.  That is a divergence between the two stores,
+        # which is what MISMATCH reports; "reset-backup" resolves it by
+        # rewriting the entry under the keyring's spelling.  Return instead of
+        # raising so one such entry cannot abort the whole listing.
+        del ring_val
+        return ("✔", "✔", "MISMATCH ⚠", "mismatched")
 
     if ring_val is not None and crypt_val is not None:
         if ring_val == crypt_val:
@@ -990,10 +1136,13 @@ def _print_credential_table_safe(
     env_keys: set[str],
     cryptfile_exists: bool,
     cf_ctx,  # unlocked cryptfile or None
+    enumerable: bool = True,
 ) -> None:
     """Print a formatted table of credentials with sync status.
 
     Shows four columns: KEY, SYSTEM KEYRING, CRYPTFILE, ENV, STATUS.
+    *enumerable* False (macOS, Linux) leaves the keyring column unknown —
+    see ``_classify_credential_row``.
     Memory-safe: retrieves values ONE at a time for comparison.
     """
     key_width = max(len(k) for k in all_keys) + 2
@@ -1009,6 +1158,7 @@ def _print_credential_table_safe(
         "ring_only": 0,
         "crypt_only": 0,
         "mismatched": 0,
+        "unknown": 0,
         "env_set": 0,
     }
 
@@ -1029,6 +1179,7 @@ def _print_credential_table_safe(
             in_ring,
             in_crypt,
             cf_ctx,
+            enumerable,
         )
         if delta in counts:
             counts[delta] += 1
@@ -1047,9 +1198,17 @@ def _print_credential_table_safe(
         parts.append(f"cryptfile only: {counts['crypt_only']}")
     if counts["mismatched"]:
         parts.append(f"mismatched: {counts['mismatched']}")
+    if counts["unknown"]:
+        parts.append(f"in backup: {counts['unknown']}")
     if counts["env_set"]:
         parts.append(f"env: {counts['env_set']}")
     print(f"  {len(all_keys)} credential(s) — {', '.join(parts)}")
+
+    if not enumerable:
+        print()
+        print("  The system keyring cannot be listed on this platform, so '?' means")
+        print("  its contents are unknown here — credentials are shown from the")
+        print("  encrypted backup. Only Windows and WSL enumerate the keyring.")
 
     _print_list_tips(counts["ring_only"], counts["crypt_only"], cryptfile_exists)
     print()

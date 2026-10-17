@@ -31,7 +31,17 @@ if ! command -v uv &>/dev/null; then
     curl --progress-bar -Lf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
-echo -e "${GREEN}  ✓${NC} uv $(uv --version 2>&1)"
+
+# Report uv's failure instead of a green tick: a command substitution's exit
+# status is discarded by the enclosing echo, so `echo "uv $(uv --version)"`
+# printed "  ✓ uv bash: uv: command not found" and carried on.
+if ! UV_VERSION="$(uv --version 2>&1)"; then
+    echo -e "${RED}Error: uv is not available.${NC}"
+    echo -e "${YELLOW}  ${UV_VERSION}${NC}"
+    echo -e "${YELLOW}  Install it manually: https://docs.astral.sh/uv/${NC}"
+    exit 1
+fi
+echo -e "${GREEN}  ✓${NC} ${UV_VERSION}"
 
 # [2/2] Install/update credstore from PyPI.  --force: re-running this
 # script upgrades an existing install (a plain ``uv tool install`` no-ops
@@ -51,13 +61,20 @@ else
     exit 1
 fi
 
-export PATH="$HOME/.local/bin:$PATH"
-
-# When piped to bash, the export above only affects this subshell.
+# Is the shim directory on the PATH the user's *next* shell will have?  This
+# check must come before any `export PATH=...` of that directory: exporting
+# first made `command -v credstore` always succeed, so the warning below was
+# unreachable and a user whose uv came from brew/apt (the [1/2] step skipped,
+# so no profile edit happened) was told everything was fine and then got
+# "credstore: command not found" in a fresh terminal.
 if ! command -v credstore &>/dev/null; then
     echo ""
     echo -e "${YELLOW}IMPORTANT: credstore is installed but not on your current PATH.${NC}"
-    echo -e "${YELLOW}  Run: source "$HOME/.local/bin/env"${NC}"
+    if [ -f "$HOME/.local/bin/env" ]; then
+        echo -e "${YELLOW}  Run: source \"\$HOME/.local/bin/env\"${NC}"
+    else
+        echo -e "${YELLOW}  Add it to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\"${NC}"
+    fi
     echo -e "${YELLOW}  Or simply open a new terminal.${NC}"
 fi
 

@@ -48,7 +48,17 @@ def unlocked_cryptfile(password: str):
     """Context manager that temporarily unlocks the cryptfile.
 
     Sets ``keyring_key`` on entry, deletes it on exit.
-    Raises ``RuntimeError`` if the cryptfile backend is not available.
+    Raises ``RuntimeError`` if the cryptfile backend is not available — either
+    it is not installed, or no master password has been set yet.
+
+    The second case has to be checked here: ``keyrings.cryptfile``'s
+    ``keyring_key`` setter *creates* the file under the password it is given
+    when none exists (``_init_keyring`` → ``_init_file``).  Without this
+    guard, a read-side command that asks for the master password —
+    ``remove``, ``get -p``, ``inject`` in cryptfile-only mode — planted a
+    backup file for a credential store that had none, locked to whatever the
+    user happened to type; ``status`` then reported dual-write as active and a
+    real ``set-password``/``set`` was refused with "Incorrect Password".
 
     Usage::
 
@@ -58,6 +68,10 @@ def unlocked_cryptfile(password: str):
     cf = get_cryptfile()
     if cf is None:
         raise RuntimeError("Cryptfile backend not available")
+    if not has_master_key():
+        raise RuntimeError(
+            "Cryptfile not available — run 'credstore set-password' first"
+        )
     cf.keyring_key = password
     try:
         yield cf

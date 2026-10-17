@@ -108,6 +108,27 @@ class TestEnumerateWsl:
         assert len(result) == 1
         assert result[0][0] == "GOOD"
 
+    def test_with_values_flag_sent_to_bridge(self, monkeypatch):
+        """The bridge is told whether to read the credential blobs at all.
+
+        With with_values=False the C# must not touch CredentialBlob: otherwise
+        every secret is base64-encoded into the child's stdout and lands in
+        this process's memory just to be discarded here.
+        """
+        captured = {}
+
+        def _run(cmd, **kw):
+            captured.update(kw)
+            return _FakeResult("[]")
+
+        monkeypatch.setattr("credstore._enumerate.subprocess.run", _run)
+
+        _enumerate_wsl("credstore")
+        assert captured["input"] == "credstore\n0\n"
+
+        _enumerate_wsl("credstore", with_values=True)
+        assert captured["input"] == "credstore\n1\n"
+
     def test_no_separator_in_entry(self, monkeypatch):
         monkeypatch.setattr(
             "credstore._enumerate.subprocess.run",

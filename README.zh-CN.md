@@ -41,7 +41,7 @@ PyPI 最新版。不带 `--force` 的 `uv tool install credstore` 在工具已�
 
 所有密钥输入均使用脱敏输入——每次按键回显 `*`，支持粘贴，实际值从不显示、不落日志。
 
-> **需要交互式终端。** 除 `status` 和 `uninject` 外，所有命令都要求交互式 TTY（`@requires_tty`）；请在真实终端中运行，而不是管道或 CI 步骤。
+> **需要交互式终端。** 除 `status`、`remove` 和 `uninject` 外，所有命令都要求交互式 TTY（`@requires_tty`）；请在真实终端中运行，而不是管道或 CI 步骤。`remove` 可在无终端环境运行：密钥链副本照样删除，只有备份清理需要终端（见注²）。
 
 ### 初始化
 
@@ -55,6 +55,20 @@ credstore set-password    # 创建 ~/.credstore/credentials.crypt（或修改主
 `CREDSTORE_FILE` 覆盖）。保留备份是刻意的：若用新密码重新加密中途失败，它是你唯一的凭据副本，
 且仍可用旧密码打开。
 
+### 备份中的 key 名称
+
+key 在两个存储中都是**区分大小写**的。加密文件里则不然：`keyrings.cryptfile` 会把 key 转义成 INI
+选项名，configparser 又把该名称折叠为小写（`gh/cli-token` → `gh_2fcli_2dtoken`），而原始大小写被
+绑进该条目的 AEAD 关联数据。因此文件本身无法区分 `myapp/api_key` 与 `MYAPP/API_KEY`——用错误
+的大小写读取会 MAC 校验失败，而不会返回错误的密钥。读取备份时会尝试所有可能产生该选项名的写法：
+
+- `reset-keyring` 与 `set-password`（改密码）在平台支持枚举时（Windows、WSL——这也是唯一能还原
+  `myApp/ApiKey` 这类混合大小写 key 的来源）向系统密钥链查询每个条目的原始写法；macOS 与 Linux
+  上则依次尝试还原名的大写与小写形式。
+- 任何写法都无法解密的条目会被**明确报告**，而不是静默丢弃。请用 `credstore set KEY` 按它当初
+  存储时的大小写重新写入；若密钥链可枚举，`credstore reset-backup` 也会从密钥链把它重写回备份。
+- 在列表中，密钥链里有、但备份无法用该名称读回的凭据会显示为 `MISMATCH ⚠`。
+
 ### 命令
 
 | 命令 | 主密码 | 说明 |
@@ -65,7 +79,7 @@ credstore set-password    # 创建 ~/.credstore/credentials.crypt（或修改主
 | `get KEY` | — | 仅密钥链，脱敏输出（`sk-…b722`） |
 | `get KEY -p` | 询问 | 双查询密钥链 + cryptfile，明文输出。不一致时报错 |
 | `remove KEY` | 询问² | 从两个存储中删除（尽力而为） |
-| `copy SOURCE DEST` | 必需¹ | 幂等复制（密钥链 + cryptfile）。若目标已注入环境变量则自动重新注入 |
+| `copy SOURCE DEST` | 必需¹ | 幂等复制（密钥链 + cryptfile，两者都已一致才算幂等）。若目标已注入环境变量则自动重新注入 |
 | *（无命令）* | 询问³ | 三重读取：密钥链 + cryptfile + 环境变量。显示每个 key 的同步状态 |
 | `inject KEY… [--shell]` | 询问³ | 持久化到系统环境：注册表（Win）或 shell 配置文件（Unix）。读密钥链；cryptfile-only 模式下读加密备份（询问主密码） |
 | `uninject KEY… [--shell]` | — | 从系统环境中移除 |
@@ -73,7 +87,7 @@ credstore set-password    # 创建 ~/.credstore/credentials.crypt（或修改主
 | `reset-backup` | 必需¹ | 同步密钥链 → cryptfile |
 
 ¹ `set`、`copy` 和 `reset-backup` 前置门控——主密码未设置前（`credstore set-password`）拒绝运行。
-² `remove` 会询问主密码以清理 cryptfile 副本；密钥链副本无论如何都会删除。
+² `remove` 会询问主密码以清理 cryptfile 副本；密钥链副本无论如何都会删除——包括在非交互式 shell 中，此时备份副本会被跳过并给出提示。若尚无备份（未运行过 `set-password`），则不会询问任何密码——没有需要清理的备份。
 ³ 仅当 cryptfile 存在时询问主密码。
 
 `--shell` 可选 `auto`（默认）、`bash`、`powershell` 或 `cmd`。
@@ -127,12 +141,12 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即�
 
 | 列 | 含义 |
 |----|------|
-| `SYSTEM KEYRING` | ✔ = 已存入 OS 密钥链 |
+| `SYSTEM KEYRING` | ✔ = 已存入 OS 密钥链；`?` = 本平台无法枚举密钥链 |
 | `CRYPTFILE` | ✔ = 已存入加密备份 |
 | `ENV` | ✔ = 当前已设为环境变量 |
-| `STATUS` | `synced`（已同步）、`keyring only`、`cryptfile only` 或 `MISMATCH ⚠`（不一致） |
+| `STATUS` | `synced`（已同步）、`keyring only`、`cryptfile only`、`MISMATCH ⚠`（不一致）或 `in backup`（密钥链为 `?`，无法比对） |
 
-> 在 **macOS** 和 **Linux** 上系统密钥链无法枚举（无列表 API），因此 `SYSTEM KEYRING` 列由 cryptfile 和环境变量推导。只有 **Windows** 和 **WSL** 会直接枚举凭据管理器。
+> 在 **macOS** 和 **Linux** 上系统密钥链完全无法枚举（无列表 API），因此该列显示 `?`、每行状态为 `in backup`，并且不给出逐 key 的同步结论与提示——在这些平台上无法确认密钥链里是否有该凭据。key 名称显示为规范形式（大写），因为文件不保留原始大小写（见[备份中的 key 名称](#备份中的-key-名称)）。只有 **Windows** 和 **WSL** 会直接枚举凭据管理器。
 
 ## 内存安全
 
@@ -246,7 +260,7 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 
 ### Keyutils 后端
 
-在 Linux（无论桌面还是无头）上，`KeyutilsBackend` 将凭据存储在内核的持久化 keyring（`@p`）中。通过 `ctypes` 直接调用 `add_key` 和 `keyctl` 系统调用——标准库外零 Python 依赖。每个凭据是一个 `"user"` 键，描述为 `"credstore:<service>/<key>"`。不支持的 CPU 架构会被拒绝而非猜测。若内核 keyring 不可用（例如 HPC 登录节点上 seccomp 屏蔽了 keyctl），credstore 降级为**仅加密文件（cryptfile-only）模式**：`set` 存入 AES 备份并给出提示，`set-password`/`status`/`get -p`/`remove` 照常工作，原因可通过 `credstore status` 查看。完全不支持的平台仍然报错，而不是错误选择后端。
+在 Linux（无论桌面还是无头）上，`KeyutilsBackend` 将凭据存储在内核的持久化 keyring（`@p`）中。通过 `ctypes` 直接调用 `add_key` 和 `keyctl` 系统调用——标准库外零 Python 依赖。每个凭据是一个 `"user"` 键，描述为 `"credstore:<service>/<key>"`。系统调用号按架构硬编码——`x86_64`、`i686`、`aarch64`、`armv7l`、`ppc64le`、`s390x`、`riscv64`——均取自内核自身的系统调用表；不在该列表中的机器会被拒绝，而不是猜一个号。若内核 keyring 不可用（例如 HPC 登录节点上 seccomp 屏蔽了 keyctl），credstore 降级为**仅加密文件（cryptfile-only）模式**：`set` 存入 AES 备份并给出提示，`set-password`/`status`/`get -p`/`remove` 照常工作，原因可通过 `credstore status` 查看。完全不支持的平台仍然报错，而不是错误选择后端。
 
 ### macOS 后端
 
@@ -262,7 +276,7 @@ macOS 在 GUI 会话中使用 `keyring.backends.macOS.Keyring`（登录钥匙串
 | **WSL** | `powershell.exe` + 嵌入式 C# `CredEnumerateW` 通过 `advapi32.dll` |
 | **其他** | 不支持——仅列出 cryptfile 和环境变量 |
 
-枚举仅获取 key 名称——永远不会批量加载密钥值。同步比对时逐个取值并立即丢弃。
+枚举仅获取 key 名称——永远不会批量加载密钥值。在 WSL 上，除非确实需要取值，PowerShell 桥接层根本不会去读取凭据 blob，因此列取操作不会把密钥从凭据管理器里搬出来。同步比对时逐个取值并立即丢弃。
 
 ## 开发
 
@@ -283,7 +297,7 @@ CI 在 Windows、macOS、Linux 上跑测试（`.github/workflows/ci.yml`），�
 改 `pyproject.toml` 里的 `version`，提交，然后推一个同名 tag：
 
 ```bash
-git tag -a v0.10.7 -m "credstore 0.10.7" && git push origin v0.10.7
+git tag -a v0.10.8 -m "credstore 0.10.8" && git push origin v0.10.8
 ```
 
 `.github/workflows/publish.yml` 会校验 tag 与包版本完全一致，不一致直接失败；通过后经 trusted publishing 上传到 PyPI。

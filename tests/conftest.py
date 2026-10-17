@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from credstore._store import DEFAULT_SERVICE
+
 from ._mocks import MockCryptfileBackend, MockKeyringBackend
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -74,6 +76,10 @@ def base_backend(monkeypatch, in_mem_store, in_mem_cryptfile):
 
     # -- has_master_key: cryptfile file always "exists" --
     monkeypatch.setattr(backend, "has_master_key", lambda: True)
+
+    # -- keyring_key_spellings: the real one enumerates Credential Manager on
+    #    Windows/WSL; unit tests must not reach the host's real store.
+    monkeypatch.setattr(sm, "keyring_key_spellings", lambda service=DEFAULT_SERVICE: {})
 
     # -- reinit_cryptfile: keep the mock, never build a real CryptFileKeyring.
     #    set-password calls reinit_cryptfile(), which normally re-runs
@@ -156,7 +162,14 @@ def cli_store(monkeypatch, in_mem_store, in_mem_cryptfile):
     # Mock _read_cryptfile_keys
     monkeypatch.setattr(
         "credstore._store._read_cryptfile_keys",
-        lambda cf: list(in_mem_cryptfile.keys()),
+        lambda cf, service=DEFAULT_SERVICE: list(in_mem_cryptfile.keys()),
+    )
+
+    # Mock keyring_key_spellings — the real one enumerates Credential Manager
+    # on Windows/WSL, which a unit test must never touch.
+    monkeypatch.setattr(
+        "credstore._store.keyring_key_spellings",
+        lambda service=DEFAULT_SERVICE: {},
     )
 
     # Mock _enumerate_system_keyring (never touch real Credential Manager)
@@ -164,6 +177,11 @@ def cli_store(monkeypatch, in_mem_store, in_mem_cryptfile):
         "credstore.__main__._enumerate_system_keyring",
         lambda service, with_values=False: [],
     )
+
+    # Mock enumeration_supported: its real answer depends on the host OS (True
+    # on Windows/WSL, False on macOS/Linux), and the list command branches on
+    # it — pinning it keeps every listing test identical across platforms.
+    monkeypatch.setattr("credstore.__main__.enumeration_supported", lambda: True)
 
     # os.path.exists — default to True (cryptfile exists)
     import os as _os

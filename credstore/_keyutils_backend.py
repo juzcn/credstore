@@ -69,25 +69,40 @@ def _machine_key() -> str:
     return _ARCH_ALIASES.get(machine, machine)
 
 
-_SYS_add_key: int | None = {
+#: Syscall numbers per architecture, read from the kernel's own tables
+#: (``arch/*/kernel/syscalls/syscall*.tbl``, and
+#: ``include/uapi/asm-generic/unistd.h`` for the generic-ABI architectures —
+#: arm64 and riscv64 have no table of their own).  The two numbers differ by 2
+#: because ``request_key`` sits between them.
+#:
+#: Getting one wrong does not fail loudly: the call lands on ``request_key``
+#: (the neighbour) or on an unrelated syscall entirely, so ``set`` breaks on a
+#: machine whose keyring is perfectly usable — and a bad keyctl number makes
+#: the ``_check_viable`` probe fail, silently degrading the whole platform to
+#: cryptfile-only.  Verify against the kernel table before adding an entry.
+_ADD_KEY_BY_ARCH = {
     "x86_64": 248,
     "aarch64": 217,
     "armv7l": 309,
-    "i686": 287,
-    "ppc64le": 310,
+    "i686": 286,
+    "ppc64le": 269,  # nospu ABI
     "s390x": 278,
-    "riscv64": 259,
-}.get(_machine_key())
+    "riscv64": 217,
+}
 
-_SYS_KEYCTL: int | None = {
+_KEYCTL_BY_ARCH = {
     "x86_64": 250,
     "aarch64": 219,
     "armv7l": 311,
     "i686": 288,
-    "ppc64le": 300,
-    "s390x": 279,
-    "riscv64": 261,
-}.get(_machine_key())
+    "ppc64le": 271,  # nospu ABI
+    "s390x": 280,
+    "riscv64": 219,
+}
+
+_SYS_add_key: int | None = _ADD_KEY_BY_ARCH.get(_machine_key())
+
+_SYS_KEYCTL: int | None = _KEYCTL_BY_ARCH.get(_machine_key())
 
 # keyctl(2) operation codes
 KEYCTL_READ = 11

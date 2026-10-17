@@ -47,7 +47,7 @@ No configuration needed. Run `credstore set-password` to enable encrypted backup
 
 All secret entry uses masked input — each keystroke echoes `*`, paste works, the actual value is never displayed or logged.
 
-> **Interactive terminal required.** Every command except `status` and `uninject` reads from an interactive TTY (`@requires_tty`); run them from a real terminal, not a piped shell or CI step.
+> **Interactive terminal required.** Every command except `status`, `remove`, and `uninject` reads from an interactive TTY (`@requires_tty`); run them from a real terminal, not a piped shell or CI step. `remove` runs headless: the keyring copy is deleted, and only the backup cleanup waits for a terminal (see note ²).
 
 ### Setup
 
@@ -63,6 +63,28 @@ backup is kept deliberately: it is the only copy of your credentials if
 re-encrypting under the new key fails part-way, and it still opens with the
 old password.
 
+### Key names in the backup
+
+Keys are matched case-sensitively in both stores. Inside the encrypted file
+they are not: `keyrings.cryptfile` escapes a key into an INI option name and
+configparser folds that name to lower case (`gh/cli-token` →
+`gh_2fcli_2dtoken`), while the original spelling is bound into the entry's
+AEAD associated data. The file alone therefore cannot tell `myapp/api_key`
+from `MYAPP/API_KEY` — and a lookup with the wrong spelling fails its MAC
+check rather than returning the wrong secret. Reads of the backup handle this
+by trying the spellings that could have produced the stored name:
+
+- `reset-keyring` and a `set-password` change ask the system keyring for each
+  entry's spelling where the platform can enumerate it (Windows, WSL — the
+  only source that can recover a mixed-case key like `myApp/ApiKey`); on macOS
+  and Linux they try the upper- and lower-case forms of the recovered name.
+- An entry that decrypts under none of those spellings is **reported**, not
+  silently dropped. Re-set it with `credstore set KEY` using the spelling it
+  was stored under; where the keyring can be listed, `credstore reset-backup`
+  rewrites it from there.
+- In the listing, a credential the keyring holds but the backup cannot read
+  back under that name shows as `MISMATCH ⚠`.
+
 ### Commands
 
 | Command | Master key | Description |
@@ -73,7 +95,7 @@ old password.
 | `get KEY` | — | Keyring only, masked output (`sk-…b722`) |
 | `get KEY -p` | prompted | Dual-query keyring + cryptfile, plaintext. Fails on mismatch |
 | `remove KEY` | prompted² | Remove from both stores (best-effort) |
-| `copy SOURCE DEST` | required¹ | Idempotent copy (keyring + cryptfile). Re-injects dest to env if previously injected |
+| `copy SOURCE DEST` | required¹ | Idempotent copy (keyring + cryptfile; both must already match). Re-injects dest to env if previously injected |
 | *(no command)* | prompted³ | Triple-read: keyring + cryptfile + env. Shows sync status per key |
 | `inject KEY… [--shell]` | prompted³ | Persist to system env: registry (Win) or shell profile (Unix). Reads keyring; in cryptfile-only mode reads the backup (prompts master pw) |
 | `uninject KEY… [--shell]` | — | Remove from system env |
@@ -81,7 +103,7 @@ old password.
 | `reset-backup` | required¹ | Sync keyring → cryptfile |
 
 ¹ `set`, `copy`, and `reset-backup` are gated up front — they refuse to run until the master key has been set (`credstore set-password`).
-² `remove` prompts for the master key to clean the cryptfile copy; the keyring copy is removed regardless.
+² `remove` prompts for the master key to clean the cryptfile copy; the keyring copy is removed regardless, including from a non-interactive shell, where the backup copy is skipped with a notice. With no backup yet (no `set-password` run) it prompts for nothing — there is nothing to clean up.
 ³ Master password prompted only if a cryptfile exists.
 
 `--shell` accepts `auto` (default), `bash`, `powershell`, or `cmd`.
@@ -135,12 +157,12 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — activate
 
 | Column | Meaning |
 |--------|---------|
-| `SYSTEM KEYRING` | ✔ = stored in OS keyring |
+| `SYSTEM KEYRING` | ✔ = stored in OS keyring; `?` = this platform cannot list the keyring |
 | `CRYPTFILE` | ✔ = stored in encrypted backup |
 | `ENV` | ✔ = currently set as environment variable |
-| `STATUS` | `synced`, `keyring only`, `cryptfile only`, or `MISMATCH ⚠` |
+| `STATUS` | `synced`, `keyring only`, `cryptfile only`, `MISMATCH ⚠`, or `in backup` (`?` keyring — nothing can be compared) |
 
-> On **macOS** and **Linux** the system keyring cannot be enumerated (no list API), so the `SYSTEM KEYRING` column is derived from the cryptfile and env. Only **Windows** and **WSL** enumerate Credential Manager directly.
+> On **macOS** and **Linux** the system keyring cannot be listed at all (no enumeration API), so the table shows `?` in that column, reports each credential as `in backup`, and gives no per-key sync verdict or tip — whether the keyring holds the credential cannot be checked there. Key names appear in their canonical (upper-case) form, since the file does not preserve the original case (see [Key names in the backup](#key-names-in-the-backup)). Only **Windows** and **WSL** enumerate Credential Manager directly.
 
 ## Memory Safety
 
@@ -256,7 +278,7 @@ On WSL, no Linux desktop keyring is available. `WslBackend` bridges to Windows C
 
 ### Keyutils Backend
 
-On Linux (desktop and headless alike), `KeyutilsBackend` stores credentials in the Linux kernel's persistent keyring (`@p`). Calls `add_key` and `keyctl` syscalls directly through `ctypes` — zero Python dependencies beyond stdlib. Each credential is a `"user"` key with description `"credstore:<service>/<key>"`. Unsupported CPU architectures are rejected rather than guessed. If the kernel keyring is unavailable (e.g. keyctl blocked by seccomp on an HPC login node), credstore degrades to **cryptfile-only** mode: `set` stores in the AES backup with a notice, `set-password`/`status`/`get -p`/`remove` keep working, and the reason is visible in `credstore status`. A fully unsupported platform still raises rather than picking a wrong backend.
+On Linux (desktop and headless alike), `KeyutilsBackend` stores credentials in the Linux kernel's persistent keyring (`@p`). Calls `add_key` and `keyctl` syscalls directly through `ctypes` — zero Python dependencies beyond stdlib. Each credential is a `"user"` key with description `"credstore:<service>/<key>"`. Syscall numbers are hard-coded per architecture — `x86_64`, `i686`, `aarch64`, `armv7l`, `ppc64le`, `s390x`, `riscv64` — and taken from the kernel's own syscall tables; a machine outside that list is rejected rather than guessed at. If the kernel keyring is unavailable (e.g. keyctl blocked by seccomp on an HPC login node), credstore degrades to **cryptfile-only** mode: `set` stores in the AES backup with a notice, `set-password`/`status`/`get -p`/`remove` keep working, and the reason is visible in `credstore status`. A fully unsupported platform still raises rather than picking a wrong backend.
 
 ### macOS Backend
 
@@ -272,7 +294,7 @@ macOS uses `keyring.backends.macOS.Keyring` (the login keychain) in GUI sessions
 | **WSL** | `powershell.exe` + inline C# `CredEnumerateW` via `advapi32.dll` |
 | **Other** | Unsupported — only cryptfile + env are listed |
 
-Enumeration retrieves key names only — secret values are never batch-loaded. Sync comparison fetches one value at a time and immediately discards it.
+Enumeration retrieves key names only — secret values are never batch-loaded. On WSL the PowerShell bridge is told not to read the credential blobs at all unless values are actually wanted, so a listing never moves secrets out of Credential Manager. Sync comparison fetches one value at a time and immediately discards it.
 
 ## Development
 
@@ -294,7 +316,7 @@ Bump `version` in `pyproject.toml`, commit, then push a tag with the same
 version:
 
 ```bash
-git tag -a v0.10.7 -m "credstore 0.10.7" && git push origin v0.10.7
+git tag -a v0.10.8 -m "credstore 0.10.8" && git push origin v0.10.8
 ```
 
 `.github/workflows/publish.yml` fails unless the tag matches the package

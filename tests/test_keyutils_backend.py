@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -292,3 +293,51 @@ class TestKeyutilsDeletePassword:
         # _search returns 5, _invalidate returns 0
         mock_libc.syscall.side_effect = [5, 0]
         be.delete_password("svc", "usr")  # does not raise
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# syscall table
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSyscallTable:
+    """The per-architecture add_key/keyctl numbers must match the kernel.
+
+    A wrong number does not fail loudly: it lands on ``request_key`` (the
+    neighbouring syscall) or on something unrelated, so ``set`` breaks — and a
+    wrong keyctl number makes the ``_check_viable`` probe fail, degrading a
+    working machine to cryptfile-only.  These are transcribed from
+    arch/*/kernel/syscalls/syscall*.tbl and asm-generic/unistd.h.
+    """
+
+    #: arch → (add_key, keyctl)
+    EXPECTED: ClassVar[dict[str, tuple[int, int]]] = {
+        "x86_64": (248, 250),
+        "aarch64": (217, 219),
+        "armv7l": (309, 311),
+        "i686": (286, 288),
+        "ppc64le": (269, 271),
+        "s390x": (278, 280),
+        "riscv64": (217, 219),
+    }
+
+    def test_numbers_match_kernel_tables(self):
+        from credstore._keyutils_backend import _ADD_KEY_BY_ARCH, _KEYCTL_BY_ARCH
+
+        assert _ADD_KEY_BY_ARCH == {a: v[0] for a, v in self.EXPECTED.items()}
+        assert _KEYCTL_BY_ARCH == {a: v[1] for a, v in self.EXPECTED.items()}
+
+    def test_request_key_sits_between_them(self):
+        """The two numbers are 2 apart on every architecture.
+
+        ``request_key`` is the syscall between them, which is exactly what a
+        table transcribed one column off would pick up.
+        """
+        for arch, (add_key, keyctl) in self.EXPECTED.items():
+            assert keyctl - add_key == 2, arch
+
+    def test_generic_abi_arches_agree(self):
+        """arm64 and riscv share asm-generic's numbering."""
+        from credstore._keyutils_backend import _ADD_KEY_BY_ARCH
+
+        assert _ADD_KEY_BY_ARCH["aarch64"] == _ADD_KEY_BY_ARCH["riscv64"]
