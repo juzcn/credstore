@@ -516,7 +516,27 @@ class TestReadCryptfileEntry:
         data = {"key": "secret123"}
         cf = MockCryptfileBackend(data, keyring_key="test-pw")
         monkeypatch.setattr(backend, "_cryptfile", cf)
+        # Unlocking is gated on the backup existing, and has_master_key() asks
+        # the filesystem about the mock's file_path — which must not be left to
+        # chance (see MockCryptfileBackend.file_path).
+        monkeypatch.setattr(backend, "has_master_key", lambda: True)
         # read_cryptfile_entry calls get_cryptfile() + unlocked_cryptfile.
         # keyring uses (service, username) — mock looks up username only.
         result = backend.read_cryptfile_entry("key", "test-pw", "svc")
         assert result == "secret123"
+
+    def test_refuses_to_unlock_when_no_backup_exists(self, monkeypatch):
+        """No master key → refuse, rather than *create* the backup.
+
+        keyrings.cryptfile's keyring_key setter initialises a new file (keyed
+        to whatever password it was handed) when none is there, so a read path
+        that skipped this check planted a backup for a store that had none.
+        """
+        from ._mocks import MockCryptfileBackend
+
+        cf = MockCryptfileBackend({"key": "secret"}, keyring_key="pw")
+        monkeypatch.setattr(backend, "_cryptfile", cf)
+        monkeypatch.setattr(backend, "has_master_key", lambda: False)
+
+        with pytest.raises(RuntimeError, match="set-password"):
+            backend.read_cryptfile_entry("key", "pw", "svc")

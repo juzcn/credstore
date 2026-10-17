@@ -23,7 +23,13 @@ class MockKeyringBackend:
         When ``None``, those operations raise ``ValueError`` (simulates
         a locked cryptfile).
     file_path:
-        Filesystem path (used by cryptfile-aware checks).
+        Filesystem path reported to code that inspects it.  ``has_master_key()``
+        is the only thing that looks at it, and it does so by path *existence* —
+        so a test that depends on "the backup exists" must point this at a
+        tmp_path or patch ``has_master_key`` itself.  Otherwise the test passes
+        or fails depending on whether that literal path happens to exist on the
+        machine running it (which is how one such test came to pass on a
+        developer's box and fail everywhere else).
     """
 
     def __init__(
