@@ -175,11 +175,12 @@ class CredentialStore:
 
     @staticmethod
     def mask(value: str) -> str:
-        """Return a masked representation for CLI display.
+        """Return the conventional masked form of a credential.
 
-        Shows first 4 + last 4 characters for human verification
-        in the terminal.  Agent tools must use ``exists()`` instead
-        — never expose partial credential data to an LLM.
+        Shows the first four and last four characters, or ``***`` when the
+        value is short enough that four characters would be most of it.  This
+        is the form a consumer shows when the credential would otherwise reach
+        a model or a log.
         """
         if not value:
             return "(empty)"
