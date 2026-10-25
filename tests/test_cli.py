@@ -327,6 +327,40 @@ class TestCliGetPassword:
         out = capsys.readouterr().out
         assert "sk-cryptfile-value" in out
 
+    def test_dual_query_initialises_the_backend_before_the_backup_check(
+        self, capsys, monkeypatch, tmp_path, clean_backend_state
+    ):
+        """A backup file on disk is enough; the backend must be initialised first.
+
+        `has_master_key()` reads the module's `_cryptfile`, which is None until
+        `init_backend()` has run.  The default `get` path reached the check
+        without initialising it, so `get --password` answered "no encrypted
+        backup yet" for a store whose `credentials.crypt` was right there — while
+        the bare listing, which *does* initialise, showed the same key as
+        synced.
+        """
+        import credstore._backend as backend
+        import credstore._store as store_mod
+
+        backup = tmp_path / "credentials.crypt"
+        backup.write_bytes(b"")
+        monkeypatch.setattr("credstore._config.get_cryptfile_path", lambda: str(backup))
+        # The system keyring is not this test's subject, and its real probe
+        # would read the machine's credential manager.
+        monkeypatch.setattr(backend, "_init_system", lambda: object())
+        monkeypatch.setattr(store_mod, "get_credential", lambda key: "sk-same")
+        monkeypatch.setattr(
+            backend, "read_cryptfile_entry", lambda key, pw, service: "sk-same"
+        )
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main(["get", "--password", "test/key"]) == 0
+        out = capsys.readouterr()
+        assert "sk-same" in out.out
+        assert "no encrypted backup" not in out.err
+
 
 # ═══════════════════════════════════════════════════════════════
 # delete

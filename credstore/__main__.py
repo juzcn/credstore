@@ -497,6 +497,13 @@ def _cmd_get(key: str, password_mode: bool = False) -> int:
         return 0
 
     # -- Password mode: dual-query with consistency check --
+    # **Initialise before asking the backend whether a backup exists.**
+    # `has_master_key()` reads `_cryptfile`, which is None until
+    # `init_backend()` has run.  Initialising on module import is deliberately
+    # not done (the platform probe is expensive), and the default `get` path
+    # reached here without it — so a store whose `credentials.crypt` was
+    # present still answered "no encrypted backup yet" and refused to read it.
+    backend_mod.init_backend()
     # No backup to compare against.  Checked before prompting: the master
     # password would be asked for nothing, and unlocking a missing cryptfile
     # creates it (see _backend.unlocked_cryptfile).
