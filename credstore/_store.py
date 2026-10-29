@@ -1,10 +1,17 @@
 """Credential store — system keyring with cryptfile backup.
 
-- get():      system keyring only (fast, no master key)
-- list_keys(): system keyring keys only — NEVER returns secret values
-- set():      system keyring only — requires the master key to already be set
-- delete():   system keyring only (cryptfile cleanup handled by CLI layer)
+The primary store is the OS keyring.  Where no usable keyring backend exists,
+the environment takes its place (see ``_envstore``): secrets are dual-written
+to the environment and the encrypted cryptfile, and reads need no master
+password.
+
+- get():      primary store only (keyring, or environment fallback) — fast,
+              no master key
+- list_keys(): primary store keys only — NEVER returns secret values
+- set():      primary store only — requires the master key to already be set
+- delete():   primary store only (cryptfile cleanup handled by CLI layer)
 - reset():    cryptfile → system keyring (explicit recovery, needs master key)
+- reset_environment(): cryptfile → environment fallback (no keyring needed)
 
 Memory safety: secrets are Python ``str`` objects (immutable).  Callers MUST
 ``del`` references after use to release them for garbage collection.  Never
@@ -16,6 +23,7 @@ from __future__ import annotations
 import logging
 
 import credstore._backend as _be
+from credstore import _envstore
 
 logger = logging.getLogger("credstore")
 
@@ -30,10 +38,13 @@ class CredentialStore:
     def __init__(self, service: str = DEFAULT_SERVICE):
         self._service = service
 
-    # ── get: system keyring only ───────────────────────────────
+    # ── get: primary store only ────────────────────────────────
 
     def get(self, key: str) -> str | None:
-        """Retrieve from system keyring only — fast, no master key.
+        """Retrieve from the primary store — fast, no master key.
+
+        The primary store is the system keyring, or the environment fallback
+        when no keyring backend is available.
 
         Prefer ``exists()`` when you only need to know whether a
         credential is stored — it returns a bool instead of the secret.
@@ -41,7 +52,7 @@ class CredentialStore:
         sk = _be.get_system_keyring()
         if sk is not None:
             return sk.get_password(self._service, key)  # type: ignore[return-value]
-        return None
+        return _envstore.get_secret(key)
 
     def exists(self, key: str) -> bool:
         """Check whether a credential exists.
@@ -52,13 +63,19 @@ class CredentialStore:
         return self.get(key) is not None
 
     def list_keys(self) -> list[str]:
-        """List credential keys from system keyring — NEVER returns values.
+        """List credential keys from the primary store — NEVER returns values.
 
-        Returns key names only.  Delegates to platform-specific
-        enumeration (win32cred on Windows, PowerShell CredEnumerate
-        on WSL).  Use ``exists()`` to check individual credentials
-        without returning the secret.
+        Returns key names only.  Keyring mode delegates to platform-specific
+        enumeration (win32cred on Windows, PowerShell CredEnumerate on WSL).
+        In environment-fallback mode the keys come from the persisted
+        environment (``CREDSTORE_KEY_*`` entries) plus the backup's own key
+        names, which are readable without decrypting the file.  Use
+        ``exists()`` to check individual credentials without returning the
+        secret.
         """
+        if _be.get_system_keyring() is None:
+            return self._env_fallback_keys()
+
         from credstore._enumerate import enumerate_system_keyring
 
         return [
@@ -68,18 +85,59 @@ class CredentialStore:
             )
         ]
 
+    def _env_fallback_keys(self) -> list[str]:
+        """Keys retrievable in environment-fallback mode.
+
+        The environment can only enumerate its escaped (``CREDSTORE_KEY_*``)
+        entries — a bare-name credential is indistinguishable from an ordinary
+        environment variable.  The cryptfile's option names need no decryption
+        to list, so they fill the gap for keys the backup knows about; where
+        the environment holds one of those keys, its original spelling is
+        preferred (the file folds names to upper case, and ``get`` needs the
+        original).
+        """
+        keys = list(_envstore.list_keys())
+        seen = {key.upper() for key in keys}
+
+        # Original spellings, case-insensitively indexed — bare names are only
+        # claimed when a key the backup knows about matches them.
+        spellings: dict[str, str] = {}
+        for name in _envstore.names():
+            key = _envstore.key_from_env_var(name) or name
+            spellings.setdefault(key.upper(), key)
+
+        cf = _be.get_cryptfile()
+        if cf is None:
+            return keys
+        try:
+            cryptfile_keys = _read_cryptfile_keys(cf, self._service)
+        except Exception:
+            # A malformed or half-written backup must not break the listing;
+            # the env-store keys above are still answers.
+            logger.debug("could not read backup keys", exc_info=True)
+            return keys
+
+        for key in cryptfile_keys:
+            if key.upper() in seen:
+                continue
+            seen.add(key.upper())
+            keys.append(spellings.get(key.upper(), key))
+        return keys
+
     # ── set ───────────────────────────────────────────────────
 
     def set(self, key: str, secret: str) -> None:
-        """Store to system keyring only.
+        """Store to the primary store.
 
+        Writes the system keyring, or — when no keyring backend is
+        available — the environment fallback (persisted for new processes).
         The encrypted cryptfile backup is written separately by the CLI
         layer (``credstore set``), which dual-writes both stores.
 
         Requires the master key to already be set (``credstore set-password``
         run once, so the cryptfile exists) and raises ``RuntimeError``
         otherwise. This is deliberate: a secret is never written to the
-        keyring alone without an encrypted backup to recover from OS
+        primary store alone without an encrypted backup to recover from OS
         password changes.
         """
         if not _be.has_master_key():
@@ -89,14 +147,16 @@ class CredentialStore:
 
         sk = _be.get_system_keyring()
         if sk is None:
-            raise RuntimeError("No system keyring available")
+            _envstore.store_secret(key, secret)
+            logger.info("credential_stored_env key=%s", key)
+            return
         sk.set_password(self._service, key, secret)
         logger.info("credential_stored key=%s", key)
 
     # ── delete ─────────────────────────────────────────────────
 
     def delete(self, key: str) -> bool:
-        """Delete from system keyring only.
+        """Delete from the primary store.
 
         Cryptfile cleanup is handled by the CLI layer (needs master key)."""
         existed = False
@@ -111,35 +171,61 @@ class CredentialStore:
                 # not fail the delete: ``existed`` stays False and the
                 # caller carries on to the cryptfile cleanup.
                 pass
+        else:
+            existed = _envstore.delete_secret(key)
 
         if existed:
             logger.info("credential_deleted key=%s", key)
         return existed
 
-    # ── reset: cryptfile → system keyring ────────────────────
+    # ── reset: cryptfile → primary store ──────────────────────
 
     def reset(self, master_password: str) -> int:
-        """Restore all credentials from cryptfile to system keyring.
+        """Restore all credentials from cryptfile to the system keyring.
 
         Reads every credential from the encrypted cryptfile using
-        *master_password*, then writes each one to the system keyring —
-        under the spelling the entry is sealed with, which is also the
-        spelling to restore it under.  Returns the count of restored
-        credentials; an entry that cannot be read is skipped with a warning
-        rather than silently dropped.
+        *master_password*, then writes each one to the system keyring under
+        the spelling the entry is sealed with, which is also the spelling to
+        restore it under.  Returns the count of restored credentials; an entry
+        that cannot be read is skipped with a warning rather than silently
+        dropped.
+
+        Raises ``RuntimeError`` when no system keyring is available — the
+        environment store is a different, plaintext target with its own entry
+        point, ``reset_environment``.
         """
         sk = _be.get_system_keyring()
         if sk is None:
-            raise RuntimeError("No system keyring available")
+            raise RuntimeError(
+                "No system keyring available.\n"
+                "Run 'credstore reset-env' to restore into the environment fallback."
+            )
+        return self._restore_from_cryptfile(master_password, sk)
 
-        # Where the keyring can be read back, a skipped entry can be repaired
-        # by re-syncing it; where it cannot (macOS, Linux), the only way out is
-        # to re-set the credential under the spelling it was stored with.
+    def reset_environment(self, master_password: str) -> int:
+        """Restore all credentials from cryptfile into the environment fallback.
+
+        The environment counterpart of ``reset``: no keyring is involved, and
+        each credential is written to the environment store (persisted for new
+        processes) under the spelling the entry is sealed with.  Used by
+        ``credstore reset-env`` when no keyring backend is available.
+        """
+        return self._restore_from_cryptfile(master_password, None)
+
+    def _restore_from_cryptfile(self, master_password: str, sk) -> int:
+        """Shared restore loop; *sk* is a keyring backend or None for env."""
+        fallback = sk is None
+
+        # Where the primary store can be read back, a skipped entry can be
+        # repaired by re-syncing it; where it cannot (macOS, Linux, the
+        # environment fallback), the only way out is to re-set the credential
+        # under the spelling it was stored with.
         from credstore._enumerate import enumeration_supported
 
+        readable_primary = not fallback and enumeration_supported()
         unreadable_hint = (
             "run 'credstore reset-backup' to rewrite it from the keyring"
-            if enumeration_supported()
+            if readable_primary
             else "the file cannot show its original spelling — re-set it with "
             "'credstore set <KEY>'"
         )
@@ -153,7 +239,10 @@ class CredentialStore:
                     entry = resolve_cryptfile_entry(cf, key, self._service, spellings)
                     if entry is not None:
                         name, value = entry
-                        sk.set_password(self._service, name, value)
+                        if fallback:
+                            _envstore.store_secret(name, value)
+                        else:
+                            sk.set_password(self._service, name, value)
                         count += 1
                         logger.info("reset_restored key=%s", name)
                         del value  # release secret after write
@@ -170,6 +259,85 @@ class CredentialStore:
 
             logger.info("reset_complete count=%d", count)
             return count
+
+    # ── backup: environment fallback → cryptfile ──────────────
+
+    def environment_backup_keys(self) -> list[str]:
+        """Keys the environment fallback can contribute to the backup.
+
+        Covers every credential the environment can name: its escaped
+        (``CREDSTORE_KEY_*``) entries, plus the original spelling of every key
+        the backup already knows about (the file's option names are readable
+        without decrypting it).  A bare-name variable that neither source
+        names cannot be distinguished from an ordinary environment variable
+        and is not guessed at.
+        """
+        cf = _be.get_cryptfile()
+        if cf is None:
+            return _envstore.list_keys()
+
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        def add(key: str) -> None:
+            if key.upper() not in seen:
+                seen.add(key.upper())
+                keys.append(key)
+
+        for key in _envstore.list_keys():
+            add(key)
+
+        # Original spellings, case-insensitively indexed — the cryptfile folds
+        # names to upper case, and writing back needs the spelling it was
+        # sealed with.
+        spellings: dict[str, str] = {}
+        for name in _envstore.names():
+            key = _envstore.key_from_env_var(name) or name
+            spellings.setdefault(key.upper(), key)
+
+        try:
+            backup_keys = _read_cryptfile_keys(cf, self._service)
+        except Exception:
+            # A malformed backup must not hide the environment-only keys
+            # above; it just cannot contribute its own names.
+            logger.debug("could not read backup keys", exc_info=True)
+            backup_keys = []
+        for key in backup_keys:
+            add(spellings.get(key.upper(), key))
+        return keys
+
+    def sync_backup_from_environment(
+        self, master_password: str
+    ) -> tuple[int, list[str]]:
+        """Rewrite cryptfile entries from the environment fallback.
+
+        The ``reset-backup`` direction when no keyring is available: the
+        environment is the primary store, so its values are authoritative.
+        One value is read, written, and released at a time.  Returns
+        ``(synced_count, skipped_keys)``; a named key the environment does not
+        hold (or the backup refuses) is reported rather than silently
+        dropped.
+        """
+        skipped: list[str] = []
+        synced = 0
+        with _be.unlocked_cryptfile(master_password) as cf:
+            for key in self.environment_backup_keys():
+                value = _envstore.get_secret(key)
+                if value is None:
+                    skipped.append(key)
+                    continue
+                try:
+                    cf.set_password(self._service, key, value)
+                    synced += 1
+                    logger.info("backup_synced key=%s", key)
+                except Exception as exc:  # noqa: BLE001 — one bad key must not abort the sync
+                    logger.warning("backup_skip key=%s err=%s", key, exc)
+                    skipped.append(key)
+                finally:
+                    del value
+
+        logger.info("backup_sync_complete count=%d skipped=%d", synced, len(skipped))
+        return synced, skipped
 
     # ── mask ──────────────────────────────────────────────────
 
@@ -306,7 +474,10 @@ def _get_store() -> CredentialStore:
 
 
 def get_credential(key: str) -> str | None:
-    """Retrieve a credential from system keyring.
+    """Retrieve a credential from the primary store.
+
+    The primary store is the system keyring, or the environment fallback
+    when no keyring backend is available.
 
     Callers MUST ``del`` the returned value after use to release the
     secret from memory as soon as possible.  Python strings are
@@ -338,11 +509,12 @@ def list_credential_keys() -> list[str]:
 
 
 def set_credential(key: str, secret: str) -> None:
-    """Store a credential to the system keyring.
+    """Store a credential to the primary store.
 
-    Writes the keyring only; the cryptfile backup is handled by the CLI.
-    Requires the master key to already be set (``credstore set-password``)
-    and raises ``RuntimeError`` otherwise. See ``CredentialStore.set``.
+    Writes the system keyring, or the environment fallback when no keyring
+    is available; the cryptfile backup is handled by the CLI.  Requires the
+    master key to already be set (``credstore set-password``) and raises
+    ``RuntimeError`` otherwise. See ``CredentialStore.set``.
     """
     _get_store().set(key, secret)
 
@@ -353,6 +525,18 @@ def delete_credential(key: str) -> bool:
 
 def reset_credentials(master_password: str) -> int:
     return _get_store().reset(master_password)
+
+
+def reset_environment_credentials(master_password: str) -> int:
+    return _get_store().reset_environment(master_password)
+
+
+def environment_backup_keys() -> list[str]:
+    return _get_store().environment_backup_keys()
+
+
+def sync_backup_from_environment(master_password: str) -> tuple[int, list[str]]:
+    return _get_store().sync_backup_from_environment(master_password)
 
 
 def get_backend_name() -> str:

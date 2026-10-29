@@ -25,6 +25,12 @@ def in_mem_cryptfile() -> dict:
     return {}
 
 
+@pytest.fixture
+def in_mem_env() -> dict:
+    """Empty in-memory dict for the environment fallback."""
+    return {}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Backend-state cleanup (prevents cross-test leakage)
 # ═══════════════════════════════════════════════════════════════════════
@@ -177,6 +183,13 @@ def cli_store(monkeypatch, in_mem_store, in_mem_cryptfile):
         "credstore.__main__._enumerate_system_keyring",
         lambda service, with_values=False: [],
     )
+
+    # The environment fallback must never touch the host's registry / env file
+    # from a unit test.  The no-keyring fixture overrides these to route at
+    # its own in-memory dict.
+    monkeypatch.setattr("credstore._envstore.has_secret", lambda k: False)
+    monkeypatch.setattr("credstore._envstore.names", list)
+    monkeypatch.setattr("credstore._envstore.list_keys", list)
 
     # Mock enumeration_supported: its real answer depends on the host OS (True
     # on Windows/WSL, False on macOS/Linux), and the list command branches on

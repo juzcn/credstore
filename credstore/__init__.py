@@ -3,13 +3,19 @@
 Cross-platform API for retrieving secrets stored in the OS keyring
 with keyrings.cryptfile encrypted backup.  The CLI (``credstore set``)
 reads secrets from masked stdin and dual-writes both stores; the Python
-API's ``set_credential()`` writes the system keyring only.
+API's ``set_credential()`` writes the primary store only.
+
+Where no OS keyring backend is available, the environment takes its place:
+``set`` dual-writes the environment and the cryptfile, and
+``get_credential()`` reads the environment — so password-free startup
+resolution keeps working without a keyring or a master password.
 
 Modules::
 
     _store.py        CredentialStore + module-level API
     _shell.py        Shell formatting helpers
-    _backend.py      Dual-write backends (system keyring + cryptfile)
+    _backend.py      Dual-write backends (primary store + cryptfile)
+    _envstore.py     Environment fallback (no OS keyring)
     _enumerate.py    Platform-specific credential enumeration
     _config.py       Config file loading
     _resolver.py     keyring: URI resolution

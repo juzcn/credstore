@@ -37,6 +37,7 @@ class TestTtyGuards:
         ["get", "--password", "test/key"],
         [],
         ["reset-keyring"],
+        ["reset-env"],
         ["reset-backup"],
     ]
 
@@ -114,11 +115,12 @@ class TestCliStatus:
         out = capsys.readouterr().out
         assert "LOCKED" in out
 
-    def test_status_shows_cryptfile_only(self, capsys, mock_backend_no_keyring):
-        """No system keyring but cryptfile ready → cryptfile-only mode."""
+    def test_status_shows_env_fallback(self, capsys, mock_backend_no_keyring):
+        """No system keyring but cryptfile ready → environment fallback mode."""
         main(["status"])
         out = capsys.readouterr().out
-        assert "cryptfile-only" in out
+        assert "environment fallback" in out
+        assert "plaintext" in out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -172,19 +174,50 @@ class TestCliSet:
         assert "test/key" not in in_mem_cryptfile
         assert "test/key" not in in_mem_store
 
-    def test_set_cryptfile_only_when_no_keyring(
-        self, capsys, mock_backend_no_keyring, in_mem_cryptfile, monkeypatch
+    def test_set_no_keyring_uses_env_fallback(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_cryptfile,
+        in_mem_env,
+        monkeypatch,
     ):
-        """No system keyring → set stores in cryptfile only, prints notice."""
-        inputs = iter(["sk-cf-only-secret", "master-pw"])
+        """No system keyring → set dual-writes the environment + cryptfile."""
+        inputs = iter(["sk-env-fallback-secret", "master-pw"])
         monkeypatch.setattr(
             "credstore.__main__.masked_input", lambda prompt="": next(inputs)
         )
         assert main(["set", "test/key"]) == 0
         captured = capsys.readouterr()
         assert "Stored: test/key" in captured.out
-        assert "cryptfile-only" in captured.err
-        assert in_mem_cryptfile.get("test/key") == "sk-cf-only-secret"
+        assert "environment fallback" in captured.err
+        assert in_mem_cryptfile.get("test/key") == "sk-env-fallback-secret"
+        assert in_mem_env.get("test/key") == "sk-env-fallback-secret"
+
+    def test_set_rolls_back_cryptfile_when_env_write_fails(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_cryptfile,
+        in_mem_env,
+        monkeypatch,
+    ):
+        """Environment write failure after the backup write → rollback."""
+        inputs = iter(["sk-secret", "master-pw"])
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": next(inputs)
+        )
+
+        import credstore._store as sm
+
+        def _fail(*args, **kwargs):
+            raise RuntimeError("cannot persist environment")
+
+        monkeypatch.setattr(sm, "set_credential", _fail)
+
+        assert main(["set", "test/key"]) == 1
+        assert "test/key" not in in_mem_cryptfile
+        assert "test/key" not in in_mem_env
 
     def test_set_cryptfile_backend_unavailable(
         self, mock_backend_no_cryptfile, monkeypatch
@@ -237,6 +270,26 @@ class TestCliGet:
         out = capsys.readouterr().out
         assert "sk-s…long" in out
         assert "sk-secret-test-value-long" not in out
+
+    def test_get_from_env_fallback_needs_no_master_password(
+        self, capsys, mock_backend_no_keyring, in_mem_env, monkeypatch
+    ):
+        """No keyring: the environment answers, with no password prompt."""
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input",
+            lambda prompt="": pytest.fail("must not prompt for a password"),
+        )
+        in_mem_env["service/key"] = "sk-env-secret-value-long"
+
+        assert main(["get", "service/key"]) == 0
+        out = capsys.readouterr().out
+        assert "sk-e…long" in out
+        assert "sk-env-secret-value-long" not in out
+
+    def test_get_env_fallback_not_found(self, capsys, mock_backend_no_keyring):
+        assert main(["get", "nonexistent/key"]) == 1
+        err = capsys.readouterr().err
+        assert "environment fallback" in err
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -326,6 +379,42 @@ class TestCliGetPassword:
         assert result == 0
         out = capsys.readouterr().out
         assert "sk-cryptfile-value" in out
+
+    def test_dual_query_match_env_fallback(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_env,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """Environment + backup agree → plaintext, no inconsistent verdict."""
+        in_mem_env["test/key"] = "sk-env-match"
+        in_mem_cryptfile["test/key"] = "sk-env-match"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main(["get", "--password", "test/key"]) == 0
+        captured = capsys.readouterr()
+        assert "sk-env-match" in captured.out
+        assert "mismatch" not in captured.err
+
+    def test_dual_query_env_fallback_mismatch(
+        self,
+        mock_backend_no_keyring,
+        in_mem_env,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """Environment and backup disagree → error, as in keyring mode."""
+        in_mem_env["test/key"] = "sk-env-a"
+        in_mem_cryptfile["test/key"] = "sk-env-b"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main(["get", "--password", "test/key"]) == 1
 
     def test_dual_query_initialises_the_backend_before_the_backup_check(
         self, capsys, monkeypatch, tmp_path, clean_backend_state
@@ -475,6 +564,27 @@ class TestCliDelete:
         out, err = capsys.readouterr()
         assert "Deleted from encrypted backup" in out
         assert "remains in the system keyring" not in err
+
+    def test_remove_env_fallback_deletes_both_stores(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_env,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """No keyring: remove clears the environment copy and the backup."""
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "test-master-pw"
+        )
+        in_mem_env["test/key"] = "secret"
+        in_mem_cryptfile["test/key"] = "secret"
+
+        assert main(["remove", "test/key"]) == 0
+        assert "test/key" not in in_mem_env
+        assert "test/key" not in in_mem_cryptfile
+        out = capsys.readouterr().out
+        assert "Deleted: test/key" in out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -667,6 +777,45 @@ class TestCliList:
         out = capsys.readouterr().out
         assert "reset-keyring" in out
 
+    def test_list_env_fallback_uses_env_as_primary_store(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_env,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """No keyring: the table's primary column is the environment."""
+        in_mem_env["svc/k1"] = "v1"
+        in_mem_cryptfile["svc/k1"] = "v1"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main([]) == 0
+        out = capsys.readouterr().out
+        assert "ENV FALLBACK" in out
+        assert "SYSTEM KEYRING" not in out
+        assert "synced" in out
+
+    def test_list_env_fallback_cryptfile_only_suggests_restore(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """No keyring: a backup-only key is compared against the environment."""
+        in_mem_cryptfile["svc/k1"] = "v1"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main([]) == 0
+        out = capsys.readouterr().out
+        assert "cryptfile only" in out
+        assert "environment fallback" in out
+
     def test_list_without_keyring_enumeration(
         self, capsys, mock_backend, in_mem_cryptfile, monkeypatch
     ):
@@ -736,6 +885,15 @@ class TestCliResetKeyring:
         assert in_mem_store["test/a"] == "val-a"
         assert in_mem_store["test/b"] == "val-b"
 
+    def test_reset_keyring_without_keyring_points_to_reset_env(
+        self, capsys, mock_backend_no_keyring
+    ):
+        """No keyring: reset-keyring explains the environment counterpart."""
+        assert main(["reset-keyring"]) == 1
+        err = capsys.readouterr().err
+        assert "no system keyring" in err
+        assert "reset-env" in err
+
     def test_reset_keyring_failure(self, mock_backend, in_mem_cryptfile, monkeypatch):
         """reset_credentials raises → exit 1, master_pw cleaned up."""
         in_mem_cryptfile["test/a"] = "val-a"
@@ -750,6 +908,59 @@ class TestCliResetKeyring:
             lambda mp: (_ for _ in ()).throw(RuntimeError("boom")),
         )
         assert main(["reset-keyring"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# reset-env
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.usefixtures("_tty")
+class TestCliResetEnv:
+    def test_reset_env_restores_to_environment_fallback(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_env,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """No keyring: reset-env restores the backup into the environment."""
+        in_mem_cryptfile["test/a"] = "val-a"
+        in_mem_cryptfile["test/b"] = "val-b"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main(["reset-env"]) == 0
+        out = capsys.readouterr().out
+        assert "Restored 2" in out
+        assert "environment fallback" in out
+        assert in_mem_env["test/a"] == "val-a"
+        assert in_mem_env["test/b"] == "val-b"
+
+    def test_reset_env_refused_when_keyring_available(self, capsys, mock_backend):
+        """With a keyring the fallback is not in use — point at inject."""
+        assert main(["reset-env"]) == 1
+        err = capsys.readouterr().err
+        assert "not in use" in err
+        assert "inject" in err
+
+    def test_reset_env_failure(
+        self, mock_backend_no_keyring, in_mem_cryptfile, monkeypatch
+    ):
+        """reset_environment raises → exit 1, master_pw cleaned up."""
+        import credstore._store as sm
+
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+        monkeypatch.setattr(
+            sm,
+            "reset_environment_credentials",
+            lambda mp: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert main(["reset-env"]) == 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -776,6 +987,42 @@ class TestCliResetBackup:
             "credstore.__main__.masked_input", lambda prompt="": "master-pw"
         )
         assert main(["reset-backup"]) == 1
+
+    def test_reset_backup_env_fallback_syncs_environment(
+        self,
+        capsys,
+        mock_backend_no_keyring,
+        in_mem_env,
+        in_mem_cryptfile,
+        monkeypatch,
+    ):
+        """No keyring: reset-backup writes the environment values to the backup."""
+        in_mem_env["test/a"] = "val-a"
+        # Known to the backup, but with no environment copy to sync.
+        in_mem_cryptfile["test/b"] = "val-b"
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+
+        assert main(["reset-backup"]) == 0
+        out, err = capsys.readouterr()
+        assert "environment fallback" in out
+        assert "Reset 1 credential(s)" in out
+        assert in_mem_cryptfile["test/a"] == "val-a"
+        assert "test/b" in err
+
+    def test_reset_backup_env_fallback_nothing_to_sync(
+        self, capsys, mock_backend_no_keyring, monkeypatch
+    ):
+        """Empty environment and backup → no prompt, nothing to do."""
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input",
+            lambda prompt="": pytest.fail("must not prompt with nothing to sync"),
+        )
+
+        assert main(["reset-backup"]) == 0
+        out = capsys.readouterr().out
+        assert "No credentials found in the environment fallback." in out
 
     def test_reset_backup_wrong_password(self, mock_backend, monkeypatch):
         """unlocked_cryptfile raises ValueError → exit 1."""
@@ -989,6 +1236,20 @@ class TestCliInject:
         )
         assert main(["inject", "NONEXISTENT", "--shell", "bash"]) == 1
 
+    def test_inject_env_fallback_needs_no_password(
+        self, capsys, mock_backend_no_keyring, in_mem_env, monkeypatch
+    ):
+        """No keyring but the value is in the environment → no prompt."""
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input",
+            lambda prompt="": pytest.fail("must not prompt for a password"),
+        )
+        in_mem_env["MY_KEY"] = "sk-env-value"
+
+        assert main(["inject", "MY_KEY", "--shell", "bash"]) == 0
+        out = capsys.readouterr().out
+        assert "export MY_KEY='sk-env-value'" in out
+
 
 @pytest.mark.usefixtures("_tty")
 class TestCliUninject:
@@ -1025,6 +1286,17 @@ class TestCliUninject:
     def test_uninject_never_fails(self, mock_backend):
         """uninject doesn't touch keyring — always succeeds."""
         assert main(["uninject", "ANYTHING"]) == 0
+
+    def test_uninject_env_fallback_removes_stored_copy(
+        self, capsys, mock_backend_no_keyring, in_mem_env
+    ):
+        """No keyring: uninject removes the variable from the store itself."""
+        in_mem_env["MY_KEY"] = "secret"
+
+        assert main(["uninject", "MY_KEY", "--shell", "bash"]) == 0
+        assert "MY_KEY" not in in_mem_env
+        out = capsys.readouterr().out
+        assert "unset MY_KEY" in out
 
 
 class TestCliInjectNonTty:
@@ -1194,9 +1466,10 @@ def mock_backend_no_cryptfile(base_backend, cli_store, monkeypatch):
 
 
 @pytest.fixture
-def mock_backend_no_keyring(base_backend, cli_store, monkeypatch):
-    """Mock where the system keyring is unavailable (cryptfile-only mode)."""
+def mock_backend_no_keyring(base_backend, cli_store, in_mem_env, monkeypatch):
+    """Mock where the system keyring is unavailable (environment fallback)."""
     import credstore._backend as backend
+    import credstore._store as sm
 
     monkeypatch.setattr(backend, "get_system_keyring", lambda: None)
     monkeypatch.setattr(
@@ -1204,21 +1477,41 @@ def mock_backend_no_keyring(base_backend, cli_store, monkeypatch):
         "get_backend_info",
         lambda: {
             "available": False,
+            "env_fallback": True,
             "backend": "MockBackend",
             "cryptfile_ready": True,
             "cryptfile_path": "/mock/credentials.crypt",
+            "env_file": "/mock/env",
         },
     )
-    import credstore._store as sm
-
     monkeypatch.setattr(
         sm,
         "check_backend",
         lambda: {
             "available": False,
+            "env_fallback": True,
             "backend": "MockBackend",
             "cryptfile_ready": True,
             "cryptfile_path": "/mock/credentials.crypt",
+            "env_file": "/mock/env",
         },
     )
+
+    # The environment is the primary store in this mode.  Route the
+    # module-level API and _envstore at one in-memory dict so no test
+    # touches the host's real registry / env file.
+    monkeypatch.setattr(sm, "get_credential", in_mem_env.get)
+    monkeypatch.setattr(sm, "set_credential", in_mem_env.__setitem__)
+    monkeypatch.setattr(
+        sm, "delete_credential", lambda k: in_mem_env.pop(k, None) is not None
+    )
+    monkeypatch.setattr("credstore._envstore.get_secret", in_mem_env.get)
+    monkeypatch.setattr("credstore._envstore.store_secret", in_mem_env.__setitem__)
+    monkeypatch.setattr(
+        "credstore._envstore.delete_secret",
+        lambda k: in_mem_env.pop(k, None) is not None,
+    )
+    monkeypatch.setattr("credstore._envstore.has_secret", lambda k: k in in_mem_env)
+    monkeypatch.setattr("credstore._envstore.list_keys", lambda: list(in_mem_env))
+    monkeypatch.setattr("credstore._envstore.names", lambda: list(in_mem_env))
     return base_backend

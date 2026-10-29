@@ -315,10 +315,13 @@ class TestCredentialStoreEdgeCases:
     """Tests for error paths and edge cases in CredentialStore."""
 
     def test_get_without_keyring(self, monkeypatch):
-        """get() returns None when system keyring is unavailable."""
+        """No keyring → get() reads the environment fallback."""
         store = CredentialStore()
         monkeypatch.setattr(be, "get_system_keyring", lambda: None)
-        assert store.get("any-key") is None
+        monkeypatch.setattr(
+            "credstore._envstore.get_secret", lambda key: "env-fallback-value"
+        )
+        assert store.get("any-key") == "env-fallback-value"
 
     def test_exists_returns_false_for_missing(self, dual_store):
         store, _data = dual_store
@@ -335,14 +338,54 @@ class TestCredentialStoreEdgeCases:
         assert isinstance(result, list)
 
     def test_list_keys_without_keyring(self, monkeypatch):
-        """list_keys() returns empty list when keyring unavailable."""
+        """No keyring → list_keys() lists the environment fallback."""
         store = CredentialStore()
         monkeypatch.setattr(be, "get_system_keyring", lambda: None)
-        monkeypatch.setattr(
-            "credstore._enumerate.enumerate_system_keyring",
-            lambda service, with_values=False: [],
+        monkeypatch.setattr(be, "get_cryptfile", lambda: None)
+        monkeypatch.setattr("credstore._envstore.list_keys", lambda: ["ENV_KEY"])
+        assert store.list_keys() == ["ENV_KEY"]
+
+    def test_list_keys_env_fallback_prefers_env_spelling(self, monkeypatch, tmp_path):
+        """The backup folds names to upper case; the environment keeps them.
+
+        A lowercase key (``mcp_oauth_token``) must be listed with the spelling
+        ``get_credential`` can actually read back.
+        """
+        store = CredentialStore()
+        monkeypatch.setattr(be, "get_system_keyring", lambda: None)
+
+        backup = tmp_path / "test.crypt"
+        backup.write_text(
+            f"[{DEFAULT_SERVICE}]\nmcp_oauth_token = tok\n", encoding="utf-8"
         )
-        assert store.list_keys() == []
+
+        class _CF:
+            file_path = str(backup)
+
+        monkeypatch.setattr(be, "get_cryptfile", lambda: _CF())
+        monkeypatch.setattr("credstore._envstore.list_keys", list)
+        monkeypatch.setattr("credstore._envstore.names", lambda: ["mcp_oauth_token"])
+
+        assert store.list_keys() == ["mcp_oauth_token"]
+
+    def test_list_keys_env_fallback_includes_backup_only_keys(
+        self, monkeypatch, tmp_path
+    ):
+        """A key the backup knows and the environment does not is still listed."""
+        store = CredentialStore()
+        monkeypatch.setattr(be, "get_system_keyring", lambda: None)
+
+        backup = tmp_path / "test.crypt"
+        backup.write_text(f"[{DEFAULT_SERVICE}]\nBACKUP_ONLY = v\n", encoding="utf-8")
+
+        class _CF:
+            file_path = str(backup)
+
+        monkeypatch.setattr(be, "get_cryptfile", lambda: _CF())
+        monkeypatch.setattr("credstore._envstore.list_keys", list)
+        monkeypatch.setattr("credstore._envstore.names", list)
+
+        assert store.list_keys() == ["BACKUP_ONLY"]
 
     def test_set_requires_master_key(self, dual_store, monkeypatch):
         """set() raises RuntimeError when master key not set."""
@@ -351,19 +394,68 @@ class TestCredentialStoreEdgeCases:
         with pytest.raises(RuntimeError, match="Master key not set"):
             store.set("key", "secret")
 
-    def test_set_requires_system_keyring(self, dual_store, monkeypatch):
-        """set() raises RuntimeError when system keyring unavailable."""
+    def test_set_without_keyring_uses_env_fallback(self, dual_store, monkeypatch):
+        """set() writes the environment fallback when no keyring is available."""
         store, _data = dual_store
         monkeypatch.setattr(be, "get_system_keyring", lambda: None)
-        with pytest.raises(RuntimeError, match="No system keyring"):
-            store.set("key", "secret")
+        written: dict[str, str] = {}
+        monkeypatch.setattr(
+            "credstore._envstore.store_secret",
+            lambda key, value: written.__setitem__(key, value),
+        )
+        store.set("key", "secret")
+        assert written == {"key": "secret"}
+
+    def test_delete_without_keyring_uses_env_fallback(self, dual_store, monkeypatch):
+        """delete() removes the environment copy when no keyring is available."""
+        store, _data = dual_store
+        monkeypatch.setattr(be, "get_system_keyring", lambda: None)
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            "credstore._envstore.delete_secret",
+            lambda key: deleted.append(key) or True,
+        )
+        assert store.delete("key") is True
+        assert deleted == ["key"]
 
     def test_reset_no_keyring(self, monkeypatch):
-        """reset() raises RuntimeError when system keyring unavailable."""
+        """reset() refuses without a keyring and points at reset-env."""
         store = CredentialStore()
         monkeypatch.setattr(be, "get_system_keyring", lambda: None)
-        with pytest.raises(RuntimeError, match="No system keyring"):
+        with pytest.raises(RuntimeError, match="reset-env"):
             store.reset("master-pw")
+
+    def test_reset_environment_no_keyring(self, monkeypatch, tmp_path):
+        """reset_environment() restores into the environment fallback."""
+        store = CredentialStore()
+        monkeypatch.setattr(be, "get_system_keyring", lambda: None)
+        monkeypatch.setattr(
+            "credstore._store.keyring_key_spellings",
+            lambda service=DEFAULT_SERVICE: {},
+        )
+
+        cf_path = tmp_path / "test.crypt"
+        cf_path.write_text(f"[{DEFAULT_SERVICE}]\ngood-key = good-val\n")
+
+        @contextmanager
+        def _unlock_with_env(pw):
+            class _CF:
+                file_path = str(cf_path)
+
+                def get_password(self, service, key):
+                    return "good-val" if key == "GOOD-KEY" else None
+
+            yield _CF()
+
+        monkeypatch.setattr(be, "unlocked_cryptfile", _unlock_with_env)
+        written: dict[str, str] = {}
+        monkeypatch.setattr(
+            "credstore._envstore.store_secret",
+            lambda key, value: written.__setitem__(key, value),
+        )
+
+        assert store.reset_environment("pw") == 1
+        assert written == {"GOOD-KEY": "good-val"}
 
     def test_reset_skip_on_get_error(self, dual_store, monkeypatch, tmp_path):
         """reset() skips keys that fail during get_password."""
@@ -482,6 +574,7 @@ class TestStoreModuleApi:
         monkeypatch.setattr("credstore._store._store", store)
         monkeypatch.setattr(be, "get_system_keyring", lambda: None)
         monkeypatch.setattr(be, "has_master_key", lambda: True)
+        monkeypatch.setattr("credstore._envstore.get_secret", lambda key: None)
         assert sm.exists_credential("anything") is False
 
     def test_get_backend_name_module(self, monkeypatch):

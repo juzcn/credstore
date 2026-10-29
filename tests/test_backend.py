@@ -438,6 +438,20 @@ class TestGetBackendInfo:
             assert info["available"] is True
             assert info["cryptfile_ready"] is False
 
+    def test_env_fallback_info(self, monkeypatch):
+        """No keyring → the info reports the environment fallback."""
+        monkeypatch.setattr(backend, "_system_keyring", None)
+        with (
+            patch("credstore._backend._init_system", return_value=None),
+            patch("credstore._backend._init_cryptfile"),
+            patch("credstore._backend.has_master_key", return_value=True),
+            patch("credstore._config.get_env_file_path", return_value="/tmp/env"),
+        ):
+            info = backend.get_backend_info()
+            assert info["available"] is False
+            assert info["env_fallback"] is True
+            assert info["env_file"] == "/tmp/env"
+
     def test_info_with_cryptfile(self):
         mock_cf = MagicMock()
         mock_cf._keyring_key = None
@@ -490,11 +504,13 @@ class TestGetActiveBackendName:
             name = backend.get_active_backend_name()
             assert "system keyring only" in name
 
-    def test_cryptfile_only(self):
+    def test_env_fallback(self):
+        """No keyring + backup → the environment is the primary store."""
         backend._cryptfile = "cf"
         with patch.object(backend, "has_master_key", return_value=True):
             name = backend.get_active_backend_name()
-            assert "cryptfile only" in name
+            assert "environment fallback" in name
+            assert "dual-write" in name
 
     def test_none(self):
         name = backend.get_active_backend_name()

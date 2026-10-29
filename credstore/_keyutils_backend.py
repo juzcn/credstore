@@ -79,7 +79,7 @@ def _machine_key() -> str:
 #: (the neighbour) or on an unrelated syscall entirely, so ``set`` breaks on a
 #: machine whose keyring is perfectly usable — and a bad keyctl number makes
 #: the ``_check_viable`` probe fail, silently degrading the whole platform to
-#: cryptfile-only.  Verify against the kernel table before adding an entry.
+#: the environment fallback.  Verify against the kernel table before adding an entry.
 _ADD_KEY_BY_ARCH = {
     "x86_64": 248,
     "aarch64": 217,

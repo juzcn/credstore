@@ -1,4 +1,4 @@
-"""Tests for credstore._config — cryptfile path resolution."""
+"""Tests for credstore._config — path resolution."""
 
 import os
 from pathlib import Path
@@ -8,7 +8,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-from credstore._config import get_cryptfile_path
+from credstore._config import get_cryptfile_path, get_env_file_path
 
 HOME = Path("/mock/home")
 
@@ -17,6 +17,7 @@ HOME = Path("/mock/home")
 def _fixed_home(monkeypatch):
     """Pin ``Path.home()`` — resolution is platform- and env-independent."""
     monkeypatch.delenv("CREDSTORE_FILE", raising=False)
+    monkeypatch.delenv("CREDSTORE_ENV_FILE", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: HOME))
 
 
@@ -44,3 +45,15 @@ class TestGetCryptfilePath:
         monkeypatch.chdir(tmp_path)
 
         assert get_cryptfile_path() == str(HOME / ".credstore" / "credentials.crypt")
+
+
+class TestGetEnvFilePath:
+    """Tests for the environment-fallback file path."""
+
+    def test_env_var_highest_priority(self):
+        with patch.dict(os.environ, {"CREDSTORE_ENV_FILE": "/env/path/env"}):
+            result = get_env_file_path()
+            assert result.replace("\\", "/") == "/env/path/env"
+
+    def test_default_is_home_credstore(self):
+        assert get_env_file_path() == str(HOME / ".credstore" / "env")

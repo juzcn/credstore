@@ -47,7 +47,7 @@ No configuration needed. Run `credstore set-password` to enable encrypted backup
 
 All secret entry uses masked input — each keystroke echoes `*`, paste works, the actual value is never displayed or logged.
 
-> **Interactive terminal required.** Every command except `status`, `remove`, and `uninject` reads from an interactive TTY (`@requires_tty`); run them from a real terminal, not a piped shell or CI step. `remove` runs headless: the keyring copy is deleted, and only the backup cleanup waits for a terminal (see note ²).
+> **Interactive terminal required.** Every command except `status`, `remove`, and `uninject` reads from an interactive TTY (`@requires_tty`); run them from a real terminal, not a piped shell or CI step. `remove` runs headless: the primary-store copy is deleted, and only the backup cleanup waits for a terminal (see note ²).
 
 ### Setup
 
@@ -91,20 +91,21 @@ by trying the spellings that could have produced the stored name:
 |---------|-----------|-------------|
 | `set-password` | sets it | Create or change the master key (≥8 chars) |
 | `status` | — | Show backend health |
-| `set KEY` | required¹ | Atomic dual-write: cryptfile → keyring. Rolls back on keyring failure |
-| `get KEY` | — | Keyring only, masked output (`sk-…b722`) |
-| `get KEY -p` | prompted | Dual-query keyring + cryptfile, plaintext. Fails on mismatch |
+| `set KEY` | required¹ | Atomic dual-write: cryptfile → primary store (keyring, or environment fallback). Rolls back on primary-store failure |
+| `get KEY` | — | Primary store only, masked output (`sk-…b722`) |
+| `get KEY -p` | prompted | Dual-query primary store + cryptfile, plaintext. Fails on mismatch |
 | `remove KEY` | prompted² | Remove from both stores (best-effort) |
-| `copy SOURCE DEST` | required¹ | Idempotent copy (keyring + cryptfile; both must already match). Re-injects dest to env if previously injected |
-| *(no command)* | prompted³ | Triple-read: keyring + cryptfile + env. Shows sync status per key |
-| `inject KEY… [--shell]` | prompted³ | Persist to system env: registry (Win) or shell profile (Unix). Reads keyring; in cryptfile-only mode reads the backup (prompts master pw) |
-| `uninject KEY… [--shell]` | — | Remove from system env |
-| `reset-keyring` | prompted | Restore all from cryptfile → keyring (disaster recovery) |
-| `reset-backup` | required¹ | Sync keyring → cryptfile |
+| `copy SOURCE DEST` | required¹ | Idempotent copy (primary store + cryptfile; both must already match). Re-injects dest to env if previously injected |
+| *(no command)* | prompted³ | Triple-read: primary store + cryptfile + env. Shows sync status per key |
+| `inject KEY… [--shell]` | — ³ | Persist to system env: registry (Win) or shell profile (Unix). Reads the primary store; falls back to the backup only when the key is missing there (prompts master pw) |
+| `uninject KEY… [--shell]` | — | Remove from system env (in fallback mode, from the environment store too) |
+| `reset-keyring` | prompted | Restore all from cryptfile → system keyring (disaster recovery) |
+| `reset-env` | prompted | Restore all from cryptfile → environment fallback (no keyring available) |
+| `reset-backup` | required¹ | Sync primary store → cryptfile |
 
 ¹ `set`, `copy`, and `reset-backup` are gated up front — they refuse to run until the master key has been set (`credstore set-password`).
-² `remove` prompts for the master key to clean the cryptfile copy; the keyring copy is removed regardless, including from a non-interactive shell, where the backup copy is skipped with a notice. With no backup yet (no `set-password` run) it prompts for nothing — there is nothing to clean up.
-³ Master password prompted only if a cryptfile exists.
+² `remove` prompts for the master key to clean the cryptfile copy; the primary-store copy is removed regardless, including from a non-interactive shell, where the backup copy is skipped with a notice. With no backup yet (no `set-password` run) it prompts for nothing — there is nothing to clean up.
+³ Master password prompted only if the primary store has no copy and the backup must be read.
 
 `--shell` accepts `auto` (default), `bash`, `powershell`, or `cmd`.
 
@@ -112,22 +113,53 @@ by trying the spellings that could have produced the stored name:
 
 | Mode | Reads from | Output | Use case |
 |------|-----------|--------|----------|
-| `get KEY` | Keyring only | Masked | Quick check, safe for screen sharing |
-| `get KEY -p` | Keyring + cryptfile | Plaintext | Verify consistency, pipe to another tool |
+| `get KEY` | Primary store only | Masked | Quick check, safe for screen sharing |
+| `get KEY -p` | Primary store + cryptfile | Plaintext | Verify consistency, pipe to another tool |
 
 `-p` mode performs a dual-query consistency check:
 
 - Both stores have the value AND they match → prints plaintext
-- One store missing → error with recovery instructions
+- One store missing → error with recovery instructions (in environment-fallback
+  mode a missing environment copy still prints the backup's value, so the old
+  cryptfile-only workflow keeps working)
 - Values differ → error, tells you which tool to run
 
-**Cryptfile-only mode** (no system keyring available — e.g. Linux where keyctl is blocked by policy): the AES cryptfile is the sole store. `set`/`copy` write there with a notice, `status` reports "cryptfile-only mode", and `get -p` returns the cryptfile value directly (no dual-query mismatch possible).
+**Environment fallback** (no usable system keyring — e.g. Linux where keyctl is
+blocked by policy): the environment takes the keyring's place. `set`/`copy`
+dual-write the environment and the AES cryptfile; `get KEY`, `inject`, and the
+Python API read the environment and need **no master password**; `status`
+reports "environment fallback". The master password is only needed to unlock
+the encrypted backup (`get -p`, `reset-env`, `remove`'s backup cleanup).
 
-> ⚠️ **CLI-only.** The Python API (`get_credential`, `exists_credential`, `resolve_uri`) reads the system keyring only and returns `None` in cryptfile-only mode — it never prompts for the master password. Consumers that rely on password-free startup resolution (like **sLife**) therefore **do not support cryptfile-only mode** — use the CLI (`credstore get KEY -p`) or, for sLife, shell environment variables (fully supported, since sLife checks `os.environ` before credstore).
+| Platform | Environment persistence |
+|----------|-------------------------|
+| Windows | `HKCU\Environment` (the `inject` store), plus the live process env |
+| Unix | `~/.credstore/env` (mode 0600, `CREDSTORE_ENV_FILE` override), sourced from `~/.bashrc`, plus the live process env |
+
+A key that is a valid environment variable name (`DEEPSEEK_API_KEY`) is stored
+under its own name, so child processes see it directly. Any other key
+(`myapp/provider/deepseek`) is stored under `CREDSTORE_KEY_` plus a reversible
+escape (`/` → `_2F`, `_` → `__`). `CREDSTORE_`-prefixed keys are always escaped,
+so a credential can never overwrite credstore's own `CREDSTORE_FILE` /
+`CREDSTORE_KEYCHAIN` settings. Reads prefer the live environment: a value
+supplied by the container runtime, CI, or a parent shell wins over the
+persisted copy.
+
+> ⚠️ **Plaintext at rest.** Unlike the keyring, environment variables are not
+> encrypted. The cryptfile remains the encrypted copy; the fallback trades
+> confidentiality at rest for password-free reads. `credstore status` warns
+> when the fallback is active.
+
+> **Python API in fallback mode.** `get_credential`, `exists_credential`, and
+> `resolve_uri` read the environment fallback without prompting, so
+> password-free startup resolution keeps working with no keyring. Only the
+> encrypted backup is unavailable to them: with no environment copy (and no
+> keyring), they return `None` / raise `KeyError`; reading the backup itself
+> still requires the CLI and the master password.
 
 ### `inject` / `uninject`
 
-`inject` reads a secret from the keyring and persists it to the system environment:
+`inject` reads a secret from the primary store (keyring, or the environment fallback) and persists it to the system environment:
 
 | Platform | Persistence | Activation |
 |----------|-------------|------------|
@@ -141,7 +173,7 @@ eval "$(credstore inject DEEPSEEK_API_KEY)"           # Bash/Zsh — activate no
 Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — activate now
 ```
 
-`uninject` reverses the operation — removes from registry or profile and prints the unset command.
+`uninject` reverses the operation — removes from registry or profile and prints the unset command. In environment-fallback mode it removes the variable from the environment store itself (the primary copy); the encrypted backup is left for `reset-env` to restore from.
 
 ### Default (bare) Output
 
@@ -162,6 +194,10 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — activate
 | `ENV` | ✔ = currently set as environment variable |
 | `STATUS` | `synced`, `keyring only`, `cryptfile only`, `MISMATCH ⚠`, or `in backup` (`?` keyring — nothing can be compared) |
 
+In **environment-fallback** mode the first column is labelled `ENV FALLBACK`
+and lists the environment copies; statuses and tips refer to it instead of the
+keyring.
+
 > On **macOS** and **Linux** the system keyring cannot be listed at all (no enumeration API), so the table shows `?` in that column, reports each credential as `in backup`, and gives no per-key sync verdict or tip — whether the keyring holds the credential cannot be checked there. Key names appear in their canonical (upper-case) form, since the file does not preserve the original case (see [Key names in the backup](#key-names-in-the-backup)). Only **Windows** and **WSL** enumerate Credential Manager directly.
 
 ## Memory Safety
@@ -179,8 +215,9 @@ Secrets are immutable Python `str` objects — they cannot be zeroed in place. M
 | `copy` | Same as `set`. Idempotent: skips if dest matches source. Re-injects dest to env if previously persisted |
 | `list` | Values fetched one-at-a-time, compared, `del`ed immediately |
 | `inject` | Value read → persisted → `del`ed. TTY: no secret on stdout |
-| `reset-keyring` | Each value `del`ed after writing to keyring |
-| `reset-backup` | Batch load unavoidable; `del entries` + `del master_pw` after sync |
+| `reset-keyring` | Each value `del`ed after writing to the system keyring |
+| `reset-env` | Each value `del`ed after writing to the environment store |
+| `reset-backup` | Keyring path batch-loads (unavoidable); environment path reads one at a time |
 
 `masked_input()` echoes `*` per keystroke — paste works, actual value never displayed.
 
@@ -189,7 +226,7 @@ Secrets are immutable Python `str` objects — they cannot be zeroed in place. M
 ```python
 import credstore
 
-# Read / check / delete (system keyring only, no prompt)
+# Read / check / delete (primary store only, no prompt)
 credstore.get_credential("myapp/api_key")      # → str | None
 credstore.exists_credential("myapp/api_key")   # → bool  (NEVER returns secret)
 credstore.list_credential_keys()               # → list[str]  (NEVER returns values)
@@ -215,12 +252,12 @@ credstore.check_backend()           # → {"available": True, "backend": "…", 
 credstore.get_backend_name()        # → "system keyring + cryptfile (dual-write)"
 ```
 
-**Python API talks to system keyring only** — no master password, no prompt. Dual-write (keyring + cryptfile) is handled by the CLI. Two exceptions worth noting:
+**Python API talks to the primary store only** — no master password, no prompt. That is the system keyring, or the environment fallback when no keyring is available (in which case reads and writes work without the master password). Dual-write (primary store + cryptfile) is handled by the CLI. Two exceptions worth noting:
 
-- `set_credential()` writes only to the system keyring, but it still **requires the master key to have been set** (`credstore set-password` run once — the cryptfile must exist) and raises `RuntimeError` otherwise. This is deliberate: a secret is never written to the keyring without an encrypted backup to survive OS password changes. It never prompts.
-- `get_credential()` and `resolve_uri()` return `None` / raise `KeyError` in cryptfile-only mode; only the CLI can read the encrypted backup.
+- `set_credential()` writes only to the primary store, but it still **requires the master key to have been set** (`credstore set-password` run once — the cryptfile must exist) and raises `RuntimeError` otherwise. This is deliberate: a secret is never written to the primary store without an encrypted backup to survive OS password changes. It never prompts.
+- `get_credential()` and `resolve_uri()` return `None` / raise `KeyError` when the primary store has no copy — the API never unlocks the cryptfile. Only the CLI can read the encrypted backup, which requires the master password.
 
-Callers of `get_credential()` and `resolve_uri()` must `del` the returned value after use. Prefer `exists_credential()` when you only need to know if a credential exists. `reset_credentials()` exists internally for the CLI (`reset-keyring`) but is not part of the public package API.
+Callers of `get_credential()` and `resolve_uri()` must `del` the returned value after use. Prefer `exists_credential()` when you only need to know if a credential exists. `reset_credentials()` (for `reset-keyring`) and `reset_environment_credentials()` (for `reset-env`) exist internally for the CLI but are not part of the public package API.
 
 ## Configuration
 
@@ -228,6 +265,12 @@ The encrypted credential file's path is resolved by precedence:
 
 1. `CREDSTORE_FILE=<path>` (env var)
 2. `~/.credstore/credentials.crypt` (default)
+
+The environment-fallback file (used only when no system keyring is available)
+is resolved separately:
+
+1. `CREDSTORE_ENV_FILE=<path>` (env var)
+2. `~/.credstore/env` (default; mode 0600, sourced from `~/.bashrc`)
 
 Resolution never depends on the current directory — not even credstore's own
 source tree: the system keyring is shared between a checkout and a production
@@ -256,20 +299,23 @@ Backend selection is **deterministic by platform** — no keyring auto-discovery
 ┌──────────────────────────────────────────────────┐
 │  CLI (__main__.py)                               │
 │  Interactive: masked_input(), master password     │
-│  Atomic dual-write: cryptfile → keyring           │
-│  Rollback on keyring failure                      │
+│  Atomic dual-write: cryptfile → primary store     │
+│  Rollback on primary-store failure                │
 ├──────────────────────────────────────────────────┤
 │  Python API (__init__.py)                        │
-│  Programmatic: no prompt, system keyring only     │
+│  Programmatic: no prompt, primary store only      │
 ├────────────────────┬─────────────────────────────┤
-│  System Keyring    │  Cryptfile Backup           │
-│  (primary)         │  (encrypted)                │
+│  Primary Store     │  Cryptfile Backup           │
+│  keyring or env    │  (encrypted)                │
 │  ────────────────  │  ───────────────────────    │
 │  Win CredMan       │  keyrings.cryptfile         │
 │  WSL (PowerShell)  │  AES-encrypted INI          │
 │  macOS Keychain    │  Survives OS pw changes     │
 │  Linux keyutils    │                             │
+│  environment *     │                             │
 └────────────────────┴─────────────────────────────┘
+
+* Environment fallback: used only where no keyring backend is usable.
 ```
 
 ### WSL Backend
@@ -278,7 +324,34 @@ On WSL, no Linux desktop keyring is available. `WslBackend` bridges to Windows C
 
 ### Keyutils Backend
 
-On Linux (desktop and headless alike), `KeyutilsBackend` stores credentials in the Linux kernel's persistent keyring (`@p`). Calls `add_key` and `keyctl` syscalls directly through `ctypes` — zero Python dependencies beyond stdlib. Each credential is a `"user"` key with description `"credstore:<service>/<key>"`. Syscall numbers are hard-coded per architecture — `x86_64`, `i686`, `aarch64`, `armv7l`, `ppc64le`, `s390x`, `riscv64` — and taken from the kernel's own syscall tables; a machine outside that list is rejected rather than guessed at. If the kernel keyring is unavailable (e.g. keyctl blocked by seccomp on an HPC login node), credstore degrades to **cryptfile-only** mode: `set` stores in the AES backup with a notice, `set-password`/`status`/`get -p`/`remove` keep working, and the reason is visible in `credstore status`. A fully unsupported platform still raises rather than picking a wrong backend.
+On Linux (desktop and headless alike), `KeyutilsBackend` stores credentials in the Linux kernel's persistent keyring (`@p`). Calls `add_key` and `keyctl` syscalls directly through `ctypes` — zero Python dependencies beyond stdlib. Each credential is a `"user"` key with description `"credstore:<service>/<key>"`. Syscall numbers are hard-coded per architecture — `x86_64`, `i686`, `aarch64`, `armv7l`, `ppc64le`, `s390x`, `riscv64` — and taken from the kernel's own syscall tables; a machine outside that list is rejected rather than guessed at. If the kernel keyring is unavailable (e.g. keyctl blocked by seccomp on an HPC login node), credstore degrades to **environment-fallback** mode: `set` dual-writes the environment and the AES backup, `get`/`inject`/the Python API read the environment with no master password, `get -p`/`set-password`/`status`/`remove` keep working, and the reason is visible in `credstore status`. A fully unsupported platform still raises rather than picking a wrong backend.
+
+### Environment Fallback
+
+Used when a supported platform has no usable keyring backend (Linux with
+keyctl blocked, a Windows host whose Credential Manager is unreachable).
+`_envstore.py` gives the environment the keyring's role:
+
+- `set` dual-writes: encrypted backup first, then the environment; a failed
+  environment write rolls the backup entry back, exactly like a failed keyring
+  write.
+- `get`, `inject`, and `get_credential()`/`resolve_uri()` read the environment
+  and never prompt. `get -p` still compares the environment copy with the
+  backup and reports drift.
+- `reset-keyring` refuses without a keyring and points at `reset-env`, which
+  restores the backup into the environment.
+- `reset-backup` syncs the environment back into the encrypted backup: escaped
+  (`CREDSTORE_KEY_*`) entries plus every key the backup already knows, matched
+  case-insensitively so the original spelling is kept. A bare-name variable
+  the backup does not know cannot be enumerated and is reported as skipped.
+- Windows persists to `HKCU\Environment`; Unix persists to
+  `~/.credstore/env` (0600, sourced from `~/.bashrc`) and also reads it
+  directly, so non-interactive processes work even when no profile is loaded.
+- Reads prefer the live process environment, so a container runtime or CI can
+  supply the value without `credstore set` at all.
+
+Environment variables are plaintext. This is the deliberate trade-off of the
+fallback; the cryptfile stays the encrypted copy.
 
 ### macOS Backend
 
@@ -292,7 +365,7 @@ macOS uses `keyring.backends.macOS.Keyring` (the login keychain) in GUI sessions
 |----------|-----|
 | **Windows** | `win32cred.CredEnumerate` |
 | **WSL** | `powershell.exe` + inline C# `CredEnumerateW` via `advapi32.dll` |
-| **Other** | Unsupported — only cryptfile + env are listed |
+| **Other** | Unsupported — the listing uses the environment fallback and the cryptfile's key names |
 
 Enumeration retrieves key names only — secret values are never batch-loaded. On WSL the PowerShell bridge is told not to read the credential blobs at all unless values are actually wanted, so a listing never moves secrets out of Credential Manager. Sync comparison fetches one value at a time and immediately discards it.
 

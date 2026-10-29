@@ -1,16 +1,17 @@
 """Dual-write backend for credstore.
 
 Architecture:
-  - System keyring: primary read/write (deterministic per-platform:
+  - Primary read/write: system keyring (deterministic per-platform:
     WinVaultKeyring / WslBackend / macOS Keychain / KeyutilsBackend)
   - keyrings.cryptfile: encrypted backup sync (survives OS password changes)
 
-On set(): write to BOTH system keyring + cryptfile.
-On get(): try system first → if missing, try cryptfile (auto-restore to system).
-On delete(): delete from BOTH.
+When a supported platform has no usable keyring backend, the environment
+takes the keyring's place (see ``_envstore``): ``set`` dual-writes the
+environment and the cryptfile, and reads need no master password.
 
-The cryptfile master password is set via ``credstore set-password``.
-Without it, secrets are stored in system keyring only (with a warning).
+On set(): write to BOTH the primary store + cryptfile.
+On get(): read the primary store (keyring or environment) only.
+On delete(): delete from BOTH.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ def unlocked_cryptfile(password: str):
     ``keyring_key`` setter *creates* the file under the password it is given
     when none exists (``_init_keyring`` → ``_init_file``).  Without this
     guard, a read-side command that asks for the master password —
-    ``remove``, ``get -p``, ``inject`` in cryptfile-only mode — planted a
+    ``remove``, ``get -p``, ``inject`` with no keyring — planted a
     backup file for a credential store that had none, locked to whatever the
     user happened to type; ``status`` then reported dual-write as active and a
     real ``set-password``/``set`` was refused with "Incorrect Password".
@@ -110,12 +111,18 @@ def init_backend(password: str | None = None) -> None:
     # Report status
     if has_master_key():
         logger.info(
-            "backend=dual system=%s cryptfile=%s",
-            type(_system_keyring).__name__ if _system_keyring else "none",
+            "backend=dual primary=%s cryptfile=%s",
+            (
+                type(_system_keyring).__name__
+                if _system_keyring
+                else "environment fallback"
+            ),
             "ready",
         )
     elif _cryptfile is not None:
         logger.warning("cryptfile needs master password — run 'credstore set-password'")
+    elif _system_keyring is None:
+        logger.warning("environment fallback only — no encrypted backup")
     else:
         logger.warning("cryptfile unavailable — secrets in system keyring only")
 
@@ -181,7 +188,7 @@ def _init_system():
 
     If a *supported* platform's backend is unavailable (e.g. Linux where
     keyctl is blocked by seccomp/policy), returns ``None`` so the caller
-    continues in **cryptfile-only** mode instead of failing every command.
+    continues in **environment-fallback** mode instead of failing every command.
     The reason is logged; ``kind`` in ``get_backend_info()`` reports why.
     """
 
@@ -223,7 +230,7 @@ def _init_system():
         )
 
     if kr is None:
-        logger.warning("system keyring unavailable — cryptfile-only mode")
+        logger.warning("system keyring unavailable — using the environment fallback")
         return None
     _activate_system_keyring(kr)
     return kr
@@ -248,7 +255,7 @@ def _init_windows_backend():
         from keyring.backends.Windows import WinVaultKeyring
 
         kr = WinVaultKeyring()
-    except Exception as exc:  # noqa: BLE001 — any failure degrades to cryptfile-only
+    except Exception as exc:  # noqa: BLE001 — any failure enables the environment fallback
         logger.warning("Windows system keyring unavailable: %s", exc)
         return None
     logger.debug("system keyring: WinVaultKeyring (deterministic)")
@@ -271,7 +278,7 @@ def _init_macos_backend():
             if keychain is None
             else MacKeyring().with_properties(keychain=keychain)
         )
-    except Exception as exc:  # noqa: BLE001 — any failure degrades to cryptfile-only
+    except Exception as exc:  # noqa: BLE001 — any failure enables the environment fallback
         logger.warning("macOS system keyring unavailable: %s", exc)
         return None
     logger.debug("system keyring: macOS Keychain (keychain=%s)", keychain or "login")
@@ -283,7 +290,7 @@ def _init_linux_backend():
 
     Returns None if the kernel keyring is unavailable (e.g. keyctl blocked
     by seccomp or container policy — common on HPC login nodes) so the
-    caller falls back to cryptfile-only storage.
+    caller falls back to environment-fallback storage.
     """
     try:
         from credstore._keyutils_backend import KeyutilsBackend
@@ -293,7 +300,7 @@ def _init_linux_backend():
             logger.warning("Linux system keyring unavailable: %s", err)
             return None
         kr = KeyutilsBackend()
-    except Exception as exc:  # noqa: BLE001 — any failure degrades to cryptfile-only
+    except Exception as exc:  # noqa: BLE001 — any failure enables the environment fallback
         logger.warning("Linux system keyring unavailable: %s", exc)
         return None
     logger.debug("system keyring: KeyutilsBackend (deterministic)")
@@ -412,9 +419,14 @@ def get_backend_info() -> dict:
 
     info: dict = {
         "available": _system_keyring is not None,
+        "env_fallback": _system_keyring is None,
         "backend": get_active_backend_name(),
         "cryptfile_ready": has_master_key(),
     }
+    if _system_keyring is None:
+        from credstore._config import get_env_file_path
+
+        info["env_file"] = get_env_file_path()
     if _cryptfile is not None:
         from credstore._config import get_cryptfile_path
 
@@ -429,8 +441,10 @@ def get_active_backend_name() -> str:
         return "system keyring + cryptfile (dual-write)"
     elif _system_keyring is not None:
         return "system keyring only (cryptfile not configured)"
+    elif has_master_key():
+        return "environment fallback + cryptfile (dual-write)"
     elif _cryptfile is not None:
-        return "cryptfile only (system keyring unavailable)"
+        return "environment fallback only (cryptfile not configured)"
     return "none"
 
 

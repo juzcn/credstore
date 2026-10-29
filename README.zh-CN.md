@@ -41,7 +41,7 @@ PyPI 最新版。不带 `--force` 的 `uv tool install credstore` 在工具已�
 
 所有密钥输入均使用脱敏输入——每次按键回显 `*`，支持粘贴，实际值从不显示、不落日志。
 
-> **需要交互式终端。** 除 `status`、`remove` 和 `uninject` 外，所有命令都要求交互式 TTY（`@requires_tty`）；请在真实终端中运行，而不是管道或 CI 步骤。`remove` 可在无终端环境运行：密钥链副本照样删除，只有备份清理需要终端（见注²）。
+> **需要交互式终端。** 除 `status`、`remove` 和 `uninject` 外，所有命令都要求交互式 TTY（`@requires_tty`）；请在真实终端中运行，而不是管道或 CI 步骤。`remove` 可在无终端环境运行：主存储副本照样删除，只有备份清理需要终端（见注²）。
 
 ### 初始化
 
@@ -75,20 +75,21 @@ key 在两个存储中都是**区分大小写**的。加密文件里则不然：
 |------|--------|------|
 | `set-password` | 设置密码 | 创建或修改主密码（≥8 字符） |
 | `status` | — | 查看后端状态 |
-| `set KEY` | 必需¹ | 原子双写：cryptfile → 密钥链。密钥链失败时回滚 |
-| `get KEY` | — | 仅密钥链，脱敏输出（`sk-…b722`） |
-| `get KEY -p` | 询问 | 双查询密钥链 + cryptfile，明文输出。不一致时报错 |
+| `set KEY` | 必需¹ | 原子双写：cryptfile → 主存储（密钥链，或环境变量回退）。主存储失败时回滚 |
+| `get KEY` | — | 仅主存储，脱敏输出（`sk-…b722`） |
+| `get KEY -p` | 询问 | 双查询主存储 + cryptfile，明文输出。不一致时报错 |
 | `remove KEY` | 询问² | 从两个存储中删除（尽力而为） |
-| `copy SOURCE DEST` | 必需¹ | 幂等复制（密钥链 + cryptfile，两者都已一致才算幂等）。若目标已注入环境变量则自动重新注入 |
-| *（无命令）* | 询问³ | 三重读取：密钥链 + cryptfile + 环境变量。显示每个 key 的同步状态 |
-| `inject KEY… [--shell]` | 询问³ | 持久化到系统环境：注册表（Win）或 shell 配置文件（Unix）。读密钥链；cryptfile-only 模式下读加密备份（询问主密码） |
-| `uninject KEY… [--shell]` | — | 从系统环境中移除 |
-| `reset-keyring` | 询问 | 从 cryptfile 恢复全部 → 密钥链（灾难恢复） |
-| `reset-backup` | 必需¹ | 同步密钥链 → cryptfile |
+| `copy SOURCE DEST` | 必需¹ | 幂等复制（主存储 + cryptfile，两者都已一致才算幂等）。若目标已注入环境变量则自动重新注入 |
+| *（无命令）* | 询问³ | 三重读取：主存储 + cryptfile + 环境变量。显示每个 key 的同步状态 |
+| `inject KEY… [--shell]` | — ³ | 持久化到系统环境：注册表（Win）或 shell 配置文件（Unix）。读主存储；仅当主存储没有该 key 时才回退读取备份（询问主密码） |
+| `uninject KEY… [--shell]` | — | 从系统环境中移除（回退模式下同时从环境存储中移除） |
+| `reset-keyring` | 询问 | 从 cryptfile 恢复全部 → 系统密钥链（灾难恢复） |
+| `reset-env` | 询问 | 从 cryptfile 恢复全部 → 环境变量回退（无密钥链时） |
+| `reset-backup` | 必需¹ | 同步主存储 → cryptfile |
 
 ¹ `set`、`copy` 和 `reset-backup` 前置门控——主密码未设置前（`credstore set-password`）拒绝运行。
-² `remove` 会询问主密码以清理 cryptfile 副本；密钥链副本无论如何都会删除——包括在非交互式 shell 中，此时备份副本会被跳过并给出提示。若尚无备份（未运行过 `set-password`），则不会询问任何密码——没有需要清理的备份。
-³ 仅当 cryptfile 存在时询问主密码。
+² `remove` 会询问主密码以清理 cryptfile 副本；主存储副本无论如何都会删除——包括在非交互式 shell 中，此时备份副本会被跳过并给出提示。若尚无备份（未运行过 `set-password`），则不会询问任何密码——没有需要清理的备份。
+³ 仅当主存储没有该 key、需要读取备份时才询问主密码。
 
 `--shell` 可选 `auto`（默认）、`bash`、`powershell` 或 `cmd`。
 
@@ -96,22 +97,31 @@ key 在两个存储中都是**区分大小写**的。加密文件里则不然：
 
 | 模式 | 读取来源 | 输出 | 适用场景 |
 |------|---------|------|---------|
-| `get KEY` | 仅密钥链 | 脱敏 | 快速检查，可安全投屏 |
-| `get KEY -p` | 密钥链 + cryptfile | 明文 | 验证一致性，管道传递给其他工具 |
+| `get KEY` | 仅主存储 | 脱敏 | 快速检查，可安全投屏 |
+| `get KEY -p` | 主存储 + cryptfile | 明文 | 验证一致性，管道传递给其他工具 |
 
 `-p` 模式执行双查询一致性校验：
 
 - 两个存储都有且一致 → 打印明文
-- 一个存储缺失 → 报错并给出恢复指令
+- 一个存储缺失 → 报错并给出恢复指令（环境回退模式下，若环境副本缺失则打印备份中的值，旧的 cryptfile-only 工作流不受影响）
 - 值不一致 → 报错，告知应执行哪个命令
 
-**仅加密文件模式**（无系统密钥链可用——例如 Linux 上 keyctl 被安全策略屏蔽）：AES cryptfile 是唯一存储。`set`/`copy` 写入并给出提示，`status` 显示 "cryptfile-only mode"，`get -p` 直接返回 cryptfile 的值（不存在双查询不一致）。
+**环境变量回退**（无可用系统密钥链——例如 Linux 上 keyctl 被安全策略屏蔽）：环境变量取代密钥链成为主存储。`set`/`copy` 双写环境与 AES cryptfile；`get KEY`、`inject` 和 Python API 直接读环境，**无需主密码**；`status` 显示 "environment fallback"。只有解锁加密备份（`get -p`、`reset-env`、`remove` 的备份清理）才需要主密码。
 
-> ⚠️ **仅 CLI。** Python API（`get_credential`、`exists_credential`、`resolve_uri`）在 cryptfile-only 模式下只读系统密钥链并返回 `None`，从不弹窗。依赖免密码启动解析的消费方（如 **sLife**）因此**不支持 cryptfile-only 模式**——请使用 CLI（`credstore get KEY -p`），或对 sLife 使用 shell 环境变量（完全兼容，sLife 先查 `os.environ` 再查 credstore）。
+| 平台 | 环境持久化方式 |
+|------|---------------|
+| Windows | `HKCU\Environment`（即 `inject` 使用的注册表存储），外加当前进程环境 |
+| Unix | `~/.credstore/env`（权限 0600，可用 `CREDSTORE_ENV_FILE` 覆盖），由 `~/.bashrc` source，外加当前进程环境 |
+
+合法的环境变量名（如 `DEEPSEEK_API_KEY`）直接作为变量名存储，子进程可读取；其它 key（如 `myapp/provider/deepseek`）存储在 `CREDSTORE_KEY_` 前缀加可逆转义之下（`/` → `_2F`，`_` → `__`）。以 `CREDSTORE_` 开头的 key 一律转义，因此凭据永远不会覆盖 credstore 自己的 `CREDSTORE_FILE` / `CREDSTORE_KEYCHAIN` 配置。读取优先使用当前进程环境：容器运行时、CI 或父 shell 提供的值优先于持久化副本。
+
+> ⚠️ **明文落盘。** 与密钥链不同，环境变量不加密。cryptfile 仍是加密副本；回退模式用静态机密性换取免密码读取。回退生效时 `credstore status` 会给出警告。
+
+> **Python API 在回退模式下可用。** `get_credential`、`exists_credential` 和 `resolve_uri` 直接读取环境回退、不会弹窗，因此无密钥链时免密码启动解析依旧可用。只有加密备份对它们不可读：主存储没有副本时返回 `None` / 抛 `KeyError`；读取备份本身仍需要 CLI 和主密码。
 
 ### `inject` / `uninject`
 
-`inject` 从密钥链读取密钥并持久化到系统环境：
+`inject` 从主存储（密钥链，或环境变量回退）读取密钥并持久化到系统环境：
 
 | 平台 | 持久化方式 | 激活 |
 |------|----------|------|
@@ -125,7 +135,7 @@ eval "$(credstore inject DEEPSEEK_API_KEY)"           # Bash/Zsh — 立即激�
 Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即激活
 ```
 
-`uninject` 执行反向操作——从注册表或配置文件中移除，并打印 unset 命令。
+`uninject` 执行反向操作——从注册表或配置文件中移除，并打印 unset 命令。环境回退模式下它同时从环境存储中删除该变量（主副本）；加密备份仍可由 `reset-env` 恢复。
 
 ### 默认（无命令）输出
 
@@ -146,6 +156,8 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即�
 | `ENV` | ✔ = 当前已设为环境变量 |
 | `STATUS` | `synced`（已同步）、`keyring only`、`cryptfile only`、`MISMATCH ⚠`（不一致）或 `in backup`（密钥链为 `?`，无法比对） |
 
+在**环境回退**模式下，第一列改标为 `ENV FALLBACK`，列出环境中的副本；状态与提示也改为针对环境存储。
+
 > 在 **macOS** 和 **Linux** 上系统密钥链完全无法枚举（无列表 API），因此该列显示 `?`、每行状态为 `in backup`，并且不给出逐 key 的同步结论与提示——在这些平台上无法确认密钥链里是否有该凭据。key 名称显示为规范形式（大写），因为文件不保留原始大小写（见[备份中的 key 名称](#备份中的-key-名称)）。只有 **Windows** 和 **WSL** 会直接枚举凭据管理器。
 
 ## 内存安全
@@ -163,8 +175,9 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即�
 | `copy` | 同 `set`。幂等：目标值相同时跳过。若目标已持久化到环境则自动重新注入 |
 | `list` | 逐个取值、比对、立即 `del` |
 | `inject` | 取值 → 持久化 → `del`。TTY 模式：stdout 无密钥内容 |
-| `reset-keyring` | 写入密钥链后逐个 `del` |
-| `reset-backup` | 批量加载不可避免；同步后 `del entries` + `del master_pw` |
+| `reset-keyring` | 写入系统密钥链后逐个 `del` |
+| `reset-env` | 写入环境存储后逐个 `del` |
+| `reset-backup` | 密钥链路径必须批量加载；环境路径逐个读取 |
 
 `masked_input()` 每次按键回显 `*`——支持粘贴，实际值从不显示。
 
@@ -173,7 +186,7 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即�
 ```python
 import credstore
 
-# 读取 / 检查 / 删除（仅系统密钥链，无需交互）
+# 读取 / 检查 / 删除（仅主存储，无需交互）
 credstore.get_credential("myapp/api_key")      # → str | None
 credstore.exists_credential("myapp/api_key")   # → bool  （绝不返回密钥值）
 credstore.list_credential_keys()               # → list[str]  （绝不返回密钥值）
@@ -199,12 +212,12 @@ credstore.check_backend()           # → {"available": True, "backend": "…", 
 credstore.get_backend_name()        # → "system keyring + cryptfile (dual-write)"
 ```
 
-**Python API 仅操作系统密钥链**——无需主密码，无需交互。双写（密钥链 + cryptfile）由 CLI 层处理。有两点值得注意：
+**Python API 仅操作主存储**——无需主密码，无需交互。主存储即系统密钥链；无可用密钥链时是环境变量回退（此时读写都不需要主密码）。双写（主存储 + cryptfile）由 CLI 层处理。有两点值得注意：
 
-- `set_credential()` 只写系统密钥链，但仍**要求主密码已设置**（运行过一次 `credstore set-password`——cryptfile 必须存在），否则抛出 `RuntimeError`。这是刻意的：绝不让密钥只存在于密钥链而没有加密备份（用于抵御 OS 密码变更）。它从不弹窗。
-- `get_credential()` 和 `resolve_uri()` 在 cryptfile-only 模式下返回 `None` / 抛 `KeyError`；只有 CLI 能读加密备份。
+- `set_credential()` 只写主存储，但仍**要求主密码已设置**（运行过一次 `credstore set-password`——cryptfile 必须存在），否则抛出 `RuntimeError`。这是刻意的：绝不让密钥只存在于主存储而没有加密备份（用于抵御 OS 密码变更）。它从不弹窗。
+- `get_credential()` 和 `resolve_uri()` 在主存储没有副本时返回 `None` / 抛 `KeyError`——API 从不解锁 cryptfile。只有 CLI 能读加密备份，且需要主密码。
 
-`get_credential()` 和 `resolve_uri()` 的调用者必须在用完后 `del` 返回值。仅需判断是否存在时，优先使用 `exists_credential()`。`reset_credentials()` 仅供 CLI 内部使用（`reset-keyring`），不属于公开包 API。
+`get_credential()` 和 `resolve_uri()` 的调用者必须在用完后 `del` 返回值。仅需判断是否存在时，优先使用 `exists_credential()`。`reset_credentials()`（对应 `reset-keyring`）和 `reset_environment_credentials()`（对应 `reset-env`）仅供 CLI 内部使用，不属于公开包 API。
 
 ## 配置
 
@@ -212,6 +225,11 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 
 1. `CREDSTORE_FILE=<path>`（环境变量）
 2. `~/.credstore/credentials.crypt`（默认值）
+
+环境变量回退（仅在无系统密钥链时使用）的明文文件另行解析：
+
+1. `CREDSTORE_ENV_FILE=<path>`（环境变量）
+2. `~/.credstore/env`（默认值；权限 0600，由 `~/.bashrc` source）
 
 解析与当前目录无关，credstore 自己的源码树也不例外：系统 keyring 在源码检出和生产安装之间是共享的，
 放在检出目录里的 cryptfile 只是把备份分叉了，并没有隔离任何东西。
@@ -238,20 +256,23 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 ┌──────────────────────────────────────────────────┐
 │  CLI (__main__.py)                               │
 │  交互式：masked_input()、主密码                   │
-│  原子双写：cryptfile → 密钥链                     │
-│  密钥链失败时回滚                                  │
+│  原子双写：cryptfile → 主存储                     │
+│  主存储失败时回滚                                  │
 ├──────────────────────────────────────────────────┤
 │  Python API (__init__.py)                        │
-│  程序化调用：无需交互、仅操作系统密钥链             │
+│  程序化调用：无需交互、仅主存储                   │
 ├────────────────────┬─────────────────────────────┤
-│  系统密钥链         │  加密文件备份                │
-│  （主存储）         │  （加密）                    │
+│  主存储             │  加密文件备份                │
+│  密钥链或环境变量    │  （加密）                    │
 │  ────────────────  │  ───────────────────────    │
 │  Win 凭据管理器     │  keyrings.cryptfile         │
 │  WSL（PowerShell） │  AES 加密 INI 文件           │
 │  macOS 钥匙串      │  OS 密码变更不受影响          │
 │  Linux keyutils    │                             │
+│  环境变量 *        │                             │
 └────────────────────┴─────────────────────────────┘
+
+* 环境变量回退：仅在无可用密钥链后端时使用。
 ```
 
 ### WSL 后端
@@ -260,7 +281,20 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 
 ### Keyutils 后端
 
-在 Linux（无论桌面还是无头）上，`KeyutilsBackend` 将凭据存储在内核的持久化 keyring（`@p`）中。通过 `ctypes` 直接调用 `add_key` 和 `keyctl` 系统调用——标准库外零 Python 依赖。每个凭据是一个 `"user"` 键，描述为 `"credstore:<service>/<key>"`。系统调用号按架构硬编码——`x86_64`、`i686`、`aarch64`、`armv7l`、`ppc64le`、`s390x`、`riscv64`——均取自内核自身的系统调用表；不在该列表中的机器会被拒绝，而不是猜一个号。若内核 keyring 不可用（例如 HPC 登录节点上 seccomp 屏蔽了 keyctl），credstore 降级为**仅加密文件（cryptfile-only）模式**：`set` 存入 AES 备份并给出提示，`set-password`/`status`/`get -p`/`remove` 照常工作，原因可通过 `credstore status` 查看。完全不支持的平台仍然报错，而不是错误选择后端。
+在 Linux（无论桌面还是无头）上，`KeyutilsBackend` 将凭据存储在内核的持久化 keyring（`@p`）中。通过 `ctypes` 直接调用 `add_key` 和 `keyctl` 系统调用——标准库外零 Python 依赖。每个凭据是一个 `"user"` 键，描述为 `"credstore:<service>/<key>"`。系统调用号按架构硬编码——`x86_64`、`i686`、`aarch64`、`armv7l`、`ppc64le`、`s390x`、`riscv64`——均取自内核自身的系统调用表；不在该列表中的机器会被拒绝，而不是猜一个号。若内核 keyring 不可用（例如 HPC 登录节点上 seccomp 屏蔽了 keyctl），credstore 降级为**环境变量回退模式**：`set` 双写环境与 AES 备份，`get`/`inject`/Python API 免主密码读取环境，`get -p`/`set-password`/`status`/`remove` 照常工作，原因可通过 `credstore status` 查看。完全不支持的平台仍然报错，而不是错误选择后端。
+
+### 环境变量回退
+
+当受支持的平台没有可用的密钥链后端时（Linux 的 keyctl 被屏蔽、Windows 凭据管理器不可达）启用。`_envstore.py` 让环境变量承担密钥链的角色：
+
+- `set` 双写：先写加密备份，再写环境；环境写入失败会像密钥链写入失败一样回滚备份条目。
+- `get`、`inject`、`get_credential()`/`resolve_uri()` 读取环境，从不弹窗。`get -p` 仍会比较环境副本与备份并报告漂移。
+- 无密钥链时 `reset-keyring` 会拒绝并提示 `reset-env`，由它从备份恢复到环境。
+- `reset-backup` 把环境同步回加密备份：转义（`CREDSTORE_KEY_*`）条目，加上备份已知的每个 key（大小写不敏感匹配，保留原始写法）。备份未知的裸名变量无法枚举，会报告为跳过。
+- Windows 持久化到 `HKCU\Environment`；Unix 持久化到 `~/.credstore/env`（0600，由 `~/.bashrc` source），并直接读取该文件，因此即使非交互进程没有加载 profile 也能工作。
+- 读取优先使用当前进程环境，容器运行时或 CI 可以直接提供值，无需 `credstore set`。
+
+环境变量是明文。这是回退模式的刻意取舍；cryptfile 仍是加密副本。
 
 ### macOS 后端
 
@@ -274,7 +308,7 @@ macOS 在 GUI 会话中使用 `keyring.backends.macOS.Keyring`（登录钥匙串
 |------|-----|
 | **Windows** | `win32cred.CredEnumerate` |
 | **WSL** | `powershell.exe` + 嵌入式 C# `CredEnumerateW` 通过 `advapi32.dll` |
-| **其他** | 不支持——仅列出 cryptfile 和环境变量 |
+| **其他** | 不支持——列表使用环境变量回退及 cryptfile 中的 key 名称 |
 
 枚举仅获取 key 名称——永远不会批量加载密钥值。在 WSL 上，除非确实需要取值，PowerShell 桥接层根本不会去读取凭据 blob，因此列取操作不会把密钥从凭据管理器里搬出来。同步比对时逐个取值并立即丢弃。
 
