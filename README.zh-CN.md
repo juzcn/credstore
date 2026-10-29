@@ -331,7 +331,7 @@ CI 在 Windows、macOS、Linux 上跑测试（`.github/workflows/ci.yml`），�
 改 `pyproject.toml` 里的 `version`，提交，然后推一个同名 tag：
 
 ```bash
-git tag -a v0.10.8 -m "credstore 0.10.8" && git push origin v0.10.8
+git tag -a v0.11.0 -m "credstore 0.11.0" && git push origin v0.11.0
 ```
 
 `.github/workflows/publish.yml` 会校验 tag 与包版本完全一致，不一致直接失败；通过后经 trusted publishing 上传到 PyPI。

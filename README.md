@@ -389,7 +389,7 @@ Bump `version` in `pyproject.toml`, commit, then push a tag with the same
 version:
 
 ```bash
-git tag -a v0.10.8 -m "credstore 0.10.8" && git push origin v0.10.8
+git tag -a v0.11.0 -m "credstore 0.11.0" && git push origin v0.11.0
 ```
 
 `.github/workflows/publish.yml` fails unless the tag matches the package
