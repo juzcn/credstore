@@ -483,6 +483,13 @@ def _cmd_set(key: str) -> int:
     the OS has no usable keyring.  Writes to cryptfile FIRST, then the primary
     store.  If the primary write fails, rolls back the cryptfile entry so both
     stores stay consistent.
+
+    A key that was previously injected into the system environment
+    (``credstore inject``) is re-injected with the new value.  Without that,
+    the keyring and the backup would hold the new secret while every new
+    process still exported the old one — an environment variable is what a
+    child process reads, not the keyring.  In environment-fallback mode the
+    primary write above already updates the environment store.
     """
     cf = backend_mod.get_cryptfile()
     if cf is None:
@@ -533,9 +540,31 @@ def _cmd_set(key: str) -> int:
         _err(str(exc))
         return 1
 
+    # 3. Keep a previously injected environment copy in sync.  The keyring
+    #    and the backup are not what a child process reads — without this, a
+    #    new secret would keep losing to the stale exported variable.  A
+    #    failure here must not undo the stored credential; it is reported.
+    was_injected = keyring_available and is_injected(key)
+    if was_injected:
+        try:
+            persist_key(key, secret)
+        except Exception as exc:  # noqa: BLE001 — auxiliary copy
+            was_injected = False
+            print(
+                f"Warning: '{key}' is injected into the environment but its "
+                f"copy could not be updated ({exc}); the variable still holds "
+                f"the previous value. Re-run 'credstore inject {key}' to retry.",
+                file=sys.stderr,
+            )
+
     del secret
     del master_pw
     print(f"Stored: {key}")
+    if was_injected:
+        print("  (re-injected to the environment)")
+        # The persisted variable is new, but the shell running this command
+        # still holds the old one — and so would anything it starts.
+        _print_inject_activation("auto", key)
     if not keyring_available:
         print(
             "  (no system keyring — stored in the environment fallback"

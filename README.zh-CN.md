@@ -75,7 +75,7 @@ key 在两个存储中都是**区分大小写**的。加密文件里则不然：
 |------|--------|------|
 | `set-password` | 设置密码 | 创建或修改主密码（≥8 字符） |
 | `status` | — | 查看后端状态 |
-| `set KEY` | 必需¹ | 原子双写：cryptfile → 主存储（密钥链，或环境变量回退）。主存储失败时回滚 |
+| `set KEY` | 必需¹ | 原子双写：cryptfile → 主存储（密钥链，或环境变量回退）。若该 key 已注入环境变量则自动重新注入。主存储失败时回滚 |
 | `get KEY` | — | 仅主存储，脱敏输出（`sk-…b722`） |
 | `get KEY -p` | 询问 | 双查询主存储 + cryptfile，明文输出。不一致时报错 |
 | `remove KEY` | 询问² | 从两个存储中删除（尽力而为） |
@@ -171,7 +171,7 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即�
 | 操作 | 清理方式 |
 |------|---------|
 | `get` / `get_credential()` | 调用者必须 `del` 返回值 |
-| `set` | 双写后 `del secret` + `del master_pw` |
+| `set` | 双写后 `del secret` + `del master_pw`。若该 key 已注入环境变量则自动重新注入 |
 | `copy` | 同 `set`。幂等：目标值相同时跳过。若目标已持久化到环境则自动重新注入 |
 | `list` | 逐个取值、比对、立即 `del` |
 | `inject` | 取值 → 持久化 → `del`。TTY 模式：stdout 无密钥内容 |

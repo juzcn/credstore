@@ -91,7 +91,7 @@ by trying the spellings that could have produced the stored name:
 |---------|-----------|-------------|
 | `set-password` | sets it | Create or change the master key (≥8 chars) |
 | `status` | — | Show backend health |
-| `set KEY` | required¹ | Atomic dual-write: cryptfile → primary store (keyring, or environment fallback). Rolls back on primary-store failure |
+| `set KEY` | required¹ | Atomic dual-write: cryptfile → primary store (keyring, or environment fallback). Re-injects to env if previously injected. Rolls back on primary-store failure |
 | `get KEY` | — | Primary store only, masked output (`sk-…b722`) |
 | `get KEY -p` | prompted | Dual-query primary store + cryptfile, plaintext. Fails on mismatch |
 | `remove KEY` | prompted² | Remove from both stores (best-effort) |
@@ -211,7 +211,7 @@ Secrets are immutable Python `str` objects — they cannot be zeroed in place. M
 | Operation | Cleanup |
 |-----------|---------|
 | `get` / `get_credential()` | Caller must `del` the returned value |
-| `set` | `del secret` + `del master_pw` after dual-write |
+| `set` | `del secret` + `del master_pw` after dual-write. Re-injects to env if previously injected |
 | `copy` | Same as `set`. Idempotent: skips if dest matches source. Re-injects dest to env if previously persisted |
 | `list` | Values fetched one-at-a-time, compared, `del`ed immediately |
 | `inject` | Value read → persisted → `del`ed. TTY: no secret on stdout |

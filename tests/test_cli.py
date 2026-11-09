@@ -130,6 +130,15 @@ class TestCliStatus:
 
 @pytest.mark.usefixtures("_tty")
 class TestCliSet:
+    @pytest.fixture(autouse=True)
+    def _no_injected(self, monkeypatch):
+        """Keep the host's persisted environment out of every set test.
+
+        ``is_injected`` reads HKCU\\Environment (or the shell profile); a real
+        True would make ``set`` write the test secret to the host.
+        """
+        monkeypatch.setattr("credstore.__main__.is_injected", lambda key: False)
+
     def test_set_empty_secret(self, mock_backend, monkeypatch):
         monkeypatch.setattr("credstore.__main__.masked_input", lambda prompt="": "")
         assert main(["set", "test/key"]) == 1
@@ -149,6 +158,67 @@ class TestCliSet:
         # Both stores have the value
         assert in_mem_store.get("test/key") == "sk-test-secret-123"
         assert in_mem_cryptfile.get("test/key") == "sk-test-secret-123"
+
+    def test_set_reinjects_a_previously_injected_key(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """A key injected earlier exports the new value to new processes.
+
+        The keyring and the backup are not what a child process reads: without
+        the re-inject, ``set`` left the variable exporting the old secret.
+        """
+        inputs = iter(["sk-new-secret", "master-pw"])
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": next(inputs)
+        )
+        monkeypatch.setattr("credstore.__main__.is_injected", lambda key: True)
+        reinjected: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "credstore.__main__.persist_key",
+            lambda key, value, shell="auto": reinjected.append((key, value)),
+        )
+
+        assert main(["set", "test/key"]) == 0
+        assert reinjected == [("test/key", "sk-new-secret")]
+        assert "re-injected" in capsys.readouterr().out
+
+    def test_set_leaves_environment_alone_when_not_injected(
+        self, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """Only a previously injected key gets an environment write."""
+        inputs = iter(["sk-secret", "master-pw"])
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": next(inputs)
+        )
+
+        def _unexpected(*args, **kwargs):
+            raise AssertionError("persist_key called for a key never injected")
+
+        monkeypatch.setattr("credstore.__main__.persist_key", _unexpected)
+        assert main(["set", "test/key"]) == 0
+
+    def test_set_reinject_failure_still_stores_and_warns(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """A failed environment write must not undo the stored credential."""
+        inputs = iter(["sk-secret", "master-pw"])
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": next(inputs)
+        )
+        monkeypatch.setattr("credstore.__main__.is_injected", lambda key: True)
+
+        def _fail(*args, **kwargs):
+            raise OSError("access denied")
+
+        monkeypatch.setattr("credstore.__main__.persist_key", _fail)
+
+        assert main(["set", "test/key"]) == 0
+        out, err = capsys.readouterr()
+        assert "Stored: test/key" in out
+        assert "re-injected" not in out
+        assert "still holds the previous value" in err
+        assert in_mem_store["test/key"] == "sk-secret"
+        assert in_mem_cryptfile["test/key"] == "sk-secret"
 
     def test_set_rollback_on_keyring_failure(
         self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
