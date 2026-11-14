@@ -200,6 +200,37 @@ class TestEnumerateWindows:
         usernames = [u for u, _ in result]
         assert usernames == ["dup", "unique"]
 
+    @pytest.mark.parametrize("service_first", [False, True])
+    def test_service_target_wins_over_compound_for_same_username(self, service_first):
+        """The service copy is the live one after an update.
+
+        WinVaultKeyring moves the old value to ``{username}@service`` and
+        writes the new value under the service target.  Enumeration must
+        report the new value regardless of the order CredEnumerate lists
+        the two entries in.
+        """
+        stale = _make_mock_cred(
+            TargetName="dup@credstore",
+            UserName="dup",
+            CredentialBlob="old".encode("utf-16-le"),
+        )
+        current = _make_mock_cred(
+            TargetName="credstore",
+            UserName="dup",
+            CredentialBlob="new".encode("utf-16-le"),
+        )
+        creds = [current, stale] if service_first else [stale, current]
+        mock_wc = _mock_win32cred_module(creds=creds)
+        mock_pywin32 = MagicMock()
+        mock_pywin32.win32cred = mock_wc
+
+        with patch.dict("sys.modules", {"win32ctypes.pywin32": mock_pywin32}):
+            from credstore._enumerate import _enumerate_windows
+
+            result = _enumerate_windows("credstore", with_values=True)
+
+        assert result == [("dup", "new")]
+
     # ------------------------------------------------------------------
     # Keys-only
     # ------------------------------------------------------------------

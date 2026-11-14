@@ -277,7 +277,9 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 
 ### WSL 后端
 
-在 WSL 上，没有可用的 Linux 桌面密钥链。`WslBackend` 通过调用 `powershell.exe` 并嵌入 C# 代码 P/Invoke `advapi32.dll`（`CredReadW`、`CredWriteW`、`CredDeleteW`）来桥接 Windows 凭据管理器。由于直接对接 CredMan，WSL 与原生 Windows 共享同一凭据存储——任一侧 `credstore set` 的数据另一侧都能读到。它还能读取原生 Windows 布局（`TargetName = service`，key 在 `UserName` 字段），使 `WinVaultKeyring` 写入的凭据在 WSL 上也能正确解析。与平台自动发现不同，`WslBackend` 被确定性地选中（无优先级竞争）。
+在 WSL 上，没有可用的 Linux 桌面密钥链。`WslBackend` 通过调用 `powershell.exe` 并嵌入 C# 代码 P/Invoke `advapi32.dll`（`CredReadW`、`CredWriteW`、`CredDeleteW`）来桥接 Windows 凭据管理器。由于直接对接 CredMan，WSL 与原生 Windows 共享同一凭据存储——任一侧 `credstore set` 的数据另一侧都能读到。
+
+存储布局与 keyring 的 `WinVaultKeyring` 完全一致：凭据的 `UserName` 就是 key，最后写入的条目占据 service 目标，被挤出的用户名移到 `{username}@{service}`。读取时先查 service 目标，再查复合目标——两个平台使用同一批条目、同一顺序。与平台自动发现不同，`WslBackend` 被确定性地选中（无优先级竞争）。
 
 ### Keyutils 后端
 
@@ -310,7 +312,7 @@ macOS 在 GUI 会话中使用 `keyring.backends.macOS.Keyring`（登录钥匙串
 | **WSL** | `powershell.exe` + 嵌入式 C# `CredEnumerateW` 通过 `advapi32.dll` |
 | **其他** | 不支持——列表使用环境变量回退及 cryptfile 中的 key 名称 |
 
-枚举仅获取 key 名称——永远不会批量加载密钥值。在 WSL 上，除非确实需要取值，PowerShell 桥接层根本不会去读取凭据 blob，因此列取操作不会把密钥从凭据管理器里搬出来。同步比对时逐个取值并立即丢弃。
+枚举仅获取 key 名称——永远不会批量加载密钥值。在 WSL 上，除非确实需要取值，PowerShell 桥接层根本不会去读取凭据 blob，因此列取操作不会把密钥从凭据管理器里搬出来。同步比对时逐个取值并立即丢弃。同一用户名在 service 目标和复合目标下都有条目时，service 副本才是当前值，枚举报告它。
 
 ## 开发
 

@@ -62,7 +62,14 @@ public class CredEnum {
         if (!CredEnumerateW(null, 0, out count, out buf)) {
             return "[]";
         }
-        var results = new System.Collections.Generic.List<string>();
+        // WinVaultKeyring keeps the entry written last under the service
+        // target and moves every displaced username to {username}@service.
+        // When one username has entries under both (an update, or a re-set
+        // after displacement), the service copy is the live one — prefer it
+        // so a stale compound value is never mistaken for the current one.
+        var chosen = new System.Collections.Generic.Dictionary<string, string>();
+        var fromService = new System.Collections.Generic.HashSet<string>();
+        var order = new System.Collections.Generic.List<string>();
         // CredEnumerateW returns an array of POINTERS to CREDENTIAL structs,
         // not a contiguous array of CREDENTIAL structs.
         for (int i = 0; i < count; i++) {
@@ -72,7 +79,8 @@ public class CredEnum {
             string user = Marshal.PtrToStringUni(cred.UserName) ?? "";
             string target = Marshal.PtrToStringUni(cred.TargetName) ?? "";
             if (user.Length == 0) continue;
-            if (target != serviceSuffix && !target.EndsWith("@" + serviceSuffix)) continue;
+            bool isService = target == serviceSuffix;
+            if (!isService && !target.EndsWith("@" + serviceSuffix)) continue;
             // withValues is false for a plain listing: the blob is left where
             // it is, so no secret is ever copied into this process, encoded,
             // or piped back to the caller.
@@ -82,9 +90,20 @@ public class CredEnum {
                 Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize);
                 blobStr = Convert.ToBase64String(bytes);
             }
-            results.Add(user + "|" + blobStr);
+            if (!chosen.ContainsKey(user)) {
+                order.Add(user);
+                chosen[user] = blobStr;
+                if (isService) fromService.Add(user);
+            } else if (isService && !fromService.Contains(user)) {
+                chosen[user] = blobStr;
+                fromService.Add(user);
+            }
         }
         CredFree(buf);
+        var results = new System.Collections.Generic.List<string>();
+        foreach (string user in order) {
+            results.Add(user + "|" + chosen[user]);
+        }
         return "[" + string.Join(",", results.ConvertAll(s => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"")) + "]";
     }
 }
@@ -267,8 +286,11 @@ def _enumerate_windows(
     if all_creds is None:
         return []
 
-    entries: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    # WinVaultKeyring's layout: the entry written last owns the service
+    # target; every displaced username lives under {username}@service.  When
+    # both exist for one username, the service copy is the live one (the
+    # compound copy is the value it had before the update), so it wins.
+    chosen: dict[str, tuple[str, dict]] = {}
     for cred in all_creds:
         target = cred.get("TargetName", "")
         cred_type = cred.get("Type", 0)
@@ -277,7 +299,6 @@ def _enumerate_windows(
         if cred_type != 1:
             continue
 
-        # Our credentials have TargetName = service or username@service
         if target != service and not target.endswith("@" + service):
             continue
 
@@ -285,12 +306,14 @@ def _enumerate_windows(
         if not username:
             continue
 
-        # Dedup: Windows Credential Manager may hold duplicate entries
-        # from different keyring backends (WinVault + fallback chain).
-        if username in seen:
+        if username in chosen and not (
+            target == service and chosen[username][0] != service
+        ):
             continue
-        seen.add(username)
+        chosen[username] = (target, cred)
 
+    entries: list[tuple[str, str]] = []
+    for username, (_target, cred) in chosen.items():
         if with_values:
             # Decode the credential blob (UTF-16 as written by keyring)
             blob = cred.get("CredentialBlob", b"")

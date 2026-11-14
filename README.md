@@ -320,7 +320,9 @@ Backend selection is **deterministic by platform** — no keyring auto-discovery
 
 ### WSL Backend
 
-On WSL, no Linux desktop keyring is available. `WslBackend` bridges to Windows Credential Manager by calling `powershell.exe` with embedded C# that P/Invokes `advapi32.dll` (`CredReadW`, `CredWriteW`, `CredDeleteW`). Because it targets CredMan directly, WSL and native Windows share the same credential store — `credstore set` on either side is visible on the other. It also reads the native-Windows layout (`TargetName = service`, key in the `UserName` field) so credentials written by `WinVaultKeyring` resolve correctly on WSL. Unlike platform auto-discovery, `WslBackend` is selected deterministically (no priority roulette).
+On WSL, no Linux desktop keyring is available. `WslBackend` bridges to Windows Credential Manager by calling `powershell.exe` with embedded C# that P/Invokes `advapi32.dll` (`CredReadW`, `CredWriteW`, `CredDeleteW`). Because it targets CredMan directly, WSL and native Windows share the same credential store — `credstore set` on either side is visible on the other.
+
+The storage layout is exactly keyring's `WinVaultKeyring` layout: the credential's `UserName` is the key, the entry that owns the service target is the one written last, and each displaced username is moved to `{username}@{service}`. Reads try the service target first and the compound target second — the same entries in the same order on both platforms. Unlike platform auto-discovery, `WslBackend` is selected deterministically (no priority roulette).
 
 ### Keyutils Backend
 
@@ -367,7 +369,7 @@ macOS uses `keyring.backends.macOS.Keyring` (the login keychain) in GUI sessions
 | **WSL** | `powershell.exe` + inline C# `CredEnumerateW` via `advapi32.dll` |
 | **Other** | Unsupported — the listing uses the environment fallback and the cryptfile's key names |
 
-Enumeration retrieves key names only — secret values are never batch-loaded. On WSL the PowerShell bridge is told not to read the credential blobs at all unless values are actually wanted, so a listing never moves secrets out of Credential Manager. Sync comparison fetches one value at a time and immediately discards it.
+Enumeration retrieves key names only — secret values are never batch-loaded. On WSL the PowerShell bridge is told not to read the credential blobs at all unless values are actually wanted, so a listing never moves secrets out of Credential Manager. Sync comparison fetches one value at a time and immediately discards it. Where one username has both a service-target entry and a compound-target entry, the service copy is the live one and is the one reported.
 
 ## Development
 

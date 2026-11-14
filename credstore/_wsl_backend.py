@@ -7,8 +7,9 @@ via ``advapi32.dll``.
 
 A proper ``KeyringBackend`` subclass, registered via the standard
 ``keyring.backends`` entry point.  Priority 9.5 beats
-``keyring_wincred.WinCredKeyring`` (9.0) when both are installed,
-ensuring our target-format and encoding fixes are active.
+``keyring_wincred.WinCredKeyring`` (9.0) when both are installed.  The
+storage layout is ``WinVaultKeyring``'s, so WSL and native Windows share one
+store with one read order.
 """
 
 from __future__ import annotations
@@ -67,14 +68,6 @@ public class CredManager {
 
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern void CredFree([In] IntPtr cred);
-
-    public static string GetCredential(string target) {
-        string blobB64, user;
-        if (!ReadCredential(target, out blobB64, out user)) {
-            return null;
-        }
-        return blobB64;
-    }
 
     public static string GetCredentialWithUser(string target) {
         string blobB64, user;
@@ -178,45 +171,14 @@ def _run_powershell(
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def _get_credential(target: str) -> str | None:
-    """Read a credential blob from Windows Credential Manager.
+def _read_credential(target: str) -> tuple[str | None, str] | None:
+    """Read a credential's blob and UserName from Credential Manager.
 
-    Returns the password string, or ``None`` if not found.
-    """
-    escaped_target = target.replace("'", "''")
-    script = f"""
-$result = [CredManager]::GetCredential('{escaped_target}')
-if ($result -eq $null) {{
-    exit 1
-}}
-Write-Output $result
-"""
-    returncode, stdout, _ = _run_powershell(script)
-
-    if returncode != 0 or not stdout:
-        return None
-
-    try:
-        password_bytes = base64.b64decode(stdout)
-        return password_bytes.decode("utf-16-le")
-    except ValueError:
-        # binascii.Error (bad base64) or UnicodeDecodeError (bad UTF-16).
-        logger.debug("Failed to decode credential blob for %s", target)
-        return None
-
-
-def _get_credential_with_user(target: str) -> tuple[str | None, str]:
-    """Read a credential's blob AND its UserName field from Credential Manager.
-
-    Returns ``(value, username)`` where *value* is the decoded password
-    (``""`` for an empty blob) and *username* is the CREDENTIAL struct's
-    UserName field.  Returns ``(None, "")`` when no credential is stored
-    under *target*.
-
-    The UserName is needed to resolve credentials that were written by the
-    native Windows keyring backend (``WinVaultKeyring``), which stores them
-    under ``TargetName = service`` keyed off ``UserName = <key>`` — the
-    opposite convention from this bridge's ``username@service``.
+    Returns ``(value, username)`` for an existing entry, or ``None`` when no
+    credential is stored under *target*.  *value* is ``""`` for an empty blob
+    and ``None`` when the stored blob is not valid UTF-16 — the entry exists,
+    but its bytes are not ours to interpret.  *username* is the CREDENTIAL
+    struct's UserName field.
     """
     escaped_target = target.replace("'", "''")
     script = f"""
@@ -229,19 +191,19 @@ Write-Output $result
     returncode, stdout, _ = _run_powershell(script)
 
     if returncode != 0 or not stdout:
-        return (None, "")
+        return None
 
     blob_b64, _, username = stdout.partition("|")
-    if blob_b64:
-        try:
-            password_bytes = base64.b64decode(blob_b64)
-            return (password_bytes.decode("utf-16-le"), username)
-        except ValueError:
-            # binascii.Error (bad base64) or UnicodeDecodeError (bad UTF-16).
-            logger.debug("Failed to decode credential blob for %s", target)
-            return (None, username)
-    # Empty blob — the entry exists with an empty value.
-    return ("", username)
+    if not blob_b64:
+        # Empty blob — the entry exists with an empty value.
+        return ("", username)
+    try:
+        password_bytes = base64.b64decode(blob_b64)
+        return (password_bytes.decode("utf-16-le"), username)
+    except ValueError:
+        # binascii.Error (bad base64) or UnicodeDecodeError (bad UTF-16).
+        logger.debug("Failed to decode credential blob for %s", target)
+        return (None, username)
 
 
 def _set_credential(target: str, username: str, password: str) -> bool:
@@ -292,6 +254,13 @@ if (-not $result) {{
 class WslBackend(KeyringBackend):
     """WSL system-keyring backend backed by Windows Credential Manager.
 
+    Storage layout is exactly ``keyring.backends.Windows.WinVaultKeyring``'s:
+    a credential's UserName is its key, the entry that owns the ``{service}``
+    target is the one written last, and every displaced username is moved to
+    the compound target ``{username}@{service}``.  Reads check the service
+    target first and the compound target second.  Native Windows and WSL
+    therefore write the same entries and resolve them in the same order.
+
     Called ``WslBackend`` (not ``WslCredBackend``) so that keyring's
     ``by_priority`` sorting works correctly — it accesses ``priority``
     as a class attribute, which ``@classproperty`` provides.
@@ -301,9 +270,9 @@ class WslBackend(KeyringBackend):
     def priority(cls) -> float:
         """Return 9.5 on WSL; raise RuntimeError otherwise.
 
-        9.5 beats ``keyring_wincred.WinCredKeyring`` (9.0) so our
-        fixes (target format + encoding) are always active when both
-        packages are installed.
+        9.5 beats ``keyring_wincred.WinCredKeyring`` (9.0) so this backend,
+        with its WinVault-compatible layout and encoding, is always active
+        when both packages are installed.
         """
         if platform.system() != "Linux":
             raise RuntimeError("WslBackend requires Linux")
@@ -312,44 +281,68 @@ class WslBackend(KeyringBackend):
         return 9.5
 
     @staticmethod
-    def _target(service: str, username: str) -> str:
-        """WinVault-compatible target: ``{username}@{service}``."""
+    def _compound_name(service: str, username: str) -> str:
+        """WinVault's displaced-entry target: ``{username}@{service}``."""
         return f"{username}@{service}"
 
     # ── KeyringBackend interface ──────────────────────────────────
 
     def get_password(self, service: str, username: str) -> str | None:
-        # Primary layout: compound target ``{username}@{service}``.
-        value = _get_credential(self._target(service, username))
-        if value is not None:
-            return value
-        # Foreign layout written by the native Windows keyring backend
-        # (WinVaultKeyring): TargetName = service, the key in the UserName
-        # field.  Only claim it when the stored UserName actually matches,
-        # since every foreign entry shares the same TargetName.
-        stored_value, stored_user = _get_credential_with_user(service)
-        if stored_user == username:
-            return stored_value
+        # WinVault order: the service target holds the most recently written
+        # entry; only when it is absent or belongs to someone else does the
+        # compound target hold this username's copy.
+        entry = _read_credential(service)
+        if entry is not None and entry[1] == username:
+            return entry[0]
+        entry = _read_credential(self._compound_name(service, username))
+        if entry is not None and entry[1] == username:
+            return entry[0]
         return None
 
     def set_password(self, service: str, username: str, password: str) -> None:
-        target = self._target(service, username)
-        if not _set_credential(target, username, password):
+        # WinVault bookkeeping: Credential Manager keys an entry by TargetName
+        # alone, so before taking over the service target, move the entry that
+        # currently owns it to its user's compound target.
+        existing = _read_credential(service)
+        if existing is not None:
+            existing_value, existing_username = existing
+            if existing_value is None:
+                raise PasswordSetError(
+                    f"Cannot preserve the existing credential for {service}: "
+                    f"its blob is not valid UTF-16"
+                )
+            if existing_username:
+                displaced = self._compound_name(service, existing_username)
+                if not _set_credential(displaced, existing_username, existing_value):
+                    raise PasswordSetError(
+                        f"Failed to move the existing credential for {service} "
+                        f"to {displaced}"
+                    )
+                logger.debug("credential_displaced target=%s", displaced)
+            else:
+                logger.debug(
+                    "overwriting service target without a UserName target=%s", service
+                )
+        if not _set_credential(service, username, password):
             raise PasswordSetError(
                 f"Failed to store credential for {service}/{username}"
             )
 
     def delete_password(self, service: str, username: str) -> None:
-        target = self._target(service, username)
-        if _delete_credential(target):
-            return
-        # No entry under ``{username}@{service}`` — it may be stored under
-        # the native-Windows layout (TargetName = service, UserName = key).
-        # Only delete the service target when it actually belongs to this
-        # username, so another Windows-written entry is never removed.
-        _, stored_user = _get_credential_with_user(service)
-        if stored_user == username and _delete_credential(service):
-            return
-        raise PasswordDeleteError(
-            f"Failed to delete credential for {service}/{username}"
-        )
+        # WinVault order: both the service target and this username's compound
+        # target can hold a copy, and each is deleted only when its UserName
+        # matches — another username's entry is never removed.
+        deleted = False
+        for target in (service, self._compound_name(service, username)):
+            entry = _read_credential(target)
+            if entry is None or entry[1] != username:
+                continue
+            if not _delete_credential(target):
+                raise PasswordDeleteError(
+                    f"Failed to delete credential for {service}/{username}"
+                )
+            deleted = True
+        if not deleted:
+            raise PasswordDeleteError(
+                f"Failed to delete credential for {service}/{username}"
+            )
