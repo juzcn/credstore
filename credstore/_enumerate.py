@@ -20,6 +20,7 @@ import subprocess
 import sys
 
 from credstore._platform import is_wsl
+from credstore._target import key_from_target
 
 __all__ = ["enumerate_system_keyring", "enumeration_supported"]
 
@@ -62,25 +63,21 @@ public class CredEnum {
         if (!CredEnumerateW(null, 0, out count, out buf)) {
             return "[]";
         }
-        // WinVaultKeyring keeps the entry written last under the service
-        // target and moves every displaced username to {username}@service.
-        // When one username has entries under both (an update, or a re-set
-        // after displacement), the service copy is the live one — prefer it
-        // so a stale compound value is never mistaken for the current one.
-        var chosen = new System.Collections.Generic.Dictionary<string, string>();
-        var fromService = new System.Collections.Generic.HashSet<string>();
-        var order = new System.Collections.Generic.List<string>();
+        // credstore writes exactly one target per credential:
+        // {service}:{key}.  Anything else under Credential Manager belongs to
+        // another application and is ignored.
+        string prefix = serviceSuffix + ":";
+        var results = new System.Collections.Generic.List<string>();
         // CredEnumerateW returns an array of POINTERS to CREDENTIAL structs,
         // not a contiguous array of CREDENTIAL structs.
         for (int i = 0; i < count; i++) {
             IntPtr credPtr = Marshal.ReadIntPtr(buf, i * IntPtr.Size);
             CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
             if (cred.Type != CRED_TYPE_GENERIC) continue;
-            string user = Marshal.PtrToStringUni(cred.UserName) ?? "";
             string target = Marshal.PtrToStringUni(cred.TargetName) ?? "";
-            if (user.Length == 0) continue;
-            bool isService = target == serviceSuffix;
-            if (!isService && !target.EndsWith("@" + serviceSuffix)) continue;
+            if (!target.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase)) continue;
+            string key = target.Substring(prefix.Length);
+            if (key.Length == 0) continue;
             // withValues is false for a plain listing: the blob is left where
             // it is, so no secret is ever copied into this process, encoded,
             // or piped back to the caller.
@@ -90,20 +87,9 @@ public class CredEnum {
                 Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize);
                 blobStr = Convert.ToBase64String(bytes);
             }
-            if (!chosen.ContainsKey(user)) {
-                order.Add(user);
-                chosen[user] = blobStr;
-                if (isService) fromService.Add(user);
-            } else if (isService && !fromService.Contains(user)) {
-                chosen[user] = blobStr;
-                fromService.Add(user);
-            }
+            results.Add(key + "|" + blobStr);
         }
         CredFree(buf);
-        var results = new System.Collections.Generic.List<string>();
-        foreach (string user in order) {
-            results.Add(user + "|" + chosen[user]);
-        }
         return "[" + string.Join(",", results.ConvertAll(s => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"")) + "]";
     }
 }
@@ -163,13 +149,13 @@ def _enumerate_wsl(service: str, with_values: bool = False) -> list[tuple[str, s
     seen: set[str] = set()
     for entry in raw_entries:
         if "|" in entry:
-            username, b64_blob = entry.split("|", 1)
+            key, b64_blob = entry.split("|", 1)
         else:
-            username, b64_blob = entry, ""
+            key, b64_blob = entry, ""
 
-        if username in seen:
+        if key in seen:
             continue
-        seen.add(username)
+        seen.add(key)
 
         if with_values and b64_blob:
             try:
@@ -180,9 +166,9 @@ def _enumerate_wsl(service: str, with_values: bool = False) -> list[tuple[str, s
             value = _decode_blob(blob)
             if value is None:
                 continue
-            entries.append((username, value))
+            entries.append((key, value))
         else:
-            entries.append((username, ""))
+            entries.append((key, ""))
 
     return entries
 
@@ -191,7 +177,7 @@ def _enumerate_wsl(service: str, with_values: bool = False) -> list[tuple[str, s
 
 
 def _decode_blob(blob: bytes) -> str | None:
-    """Decode a credential blob: UTF-16 (keyring's write format), then UTF-8.
+    """Decode a credential blob: UTF-16LE (credstore's write format), then UTF-8.
 
     Returns None when neither decoding works (the blob is not text) —
     such an entry is skipped rather than syncing opaque bytes into the
@@ -286,11 +272,7 @@ def _enumerate_windows(
     if all_creds is None:
         return []
 
-    # WinVaultKeyring's layout: the entry written last owns the service
-    # target; every displaced username lives under {username}@service.  When
-    # both exist for one username, the service copy is the live one (the
-    # compound copy is the value it had before the update), so it wins.
-    chosen: dict[str, tuple[str, dict]] = {}
+    entries: list[tuple[str, str]] = []
     for cred in all_creds:
         target = cred.get("TargetName", "")
         cred_type = cred.get("Type", 0)
@@ -299,23 +281,14 @@ def _enumerate_windows(
         if cred_type != 1:
             continue
 
-        if target != service and not target.endswith("@" + service):
+        # credstore writes exactly one target per credential:
+        # {service}:{key}.  Anything else belongs to another application.
+        key = key_from_target(service, target)
+        if key is None:
             continue
 
-        username = cred.get("UserName", "")
-        if not username:
-            continue
-
-        if username in chosen and not (
-            target == service and chosen[username][0] != service
-        ):
-            continue
-        chosen[username] = (target, cred)
-
-    entries: list[tuple[str, str]] = []
-    for username, (_target, cred) in chosen.items():
         if with_values:
-            # Decode the credential blob (UTF-16 as written by keyring)
+            # Decode the credential blob (UTF-16LE as written by credstore)
             blob = cred.get("CredentialBlob", b"")
             try:
                 value = blob.decode("utf-16")
@@ -324,10 +297,10 @@ def _enumerate_windows(
                     value = blob.decode("utf-8")
                 except (UnicodeDecodeError, UnicodeError):
                     continue
-            entries.append((username, value))
+            entries.append((key, value))
         else:
             # Keys only — never decode secret values for enumeration
-            entries.append((username, ""))
+            entries.append((key, ""))
 
     # Discard raw credential structures from memory
     del all_creds

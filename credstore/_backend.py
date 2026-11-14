@@ -2,7 +2,7 @@
 
 Architecture:
   - Primary read/write: system keyring (deterministic per-platform:
-    WinVaultKeyring / WslBackend / macOS Keychain / KeyutilsBackend)
+    WinBackend / WslBackend / macOS Keychain / KeyutilsBackend)
   - keyrings.cryptfile: encrypted backup sync (survives OS password changes)
 
 When a supported platform has no usable keyring backend, the environment
@@ -177,8 +177,8 @@ def _init_system():
 
     Backend matrix (only these platforms are supported):
 
-      Windows            WinVaultKeyring      (Credential Manager / Vault)
-      WSL                WslBackend           (PowerShell bridge → CredMan)
+      Windows            WinBackend           (Credential Manager, service:key)
+      WSL                WslBackend           (PowerShell bridge → CredMan, same layout)
       macOS (GUI)        macOS.Keyring        (login keychain)
       macOS (headless)   macOS.Keyring +      (isolated keychain file via
                            with_properties      CREDSTORE_KEYCHAIN)
@@ -244,21 +244,24 @@ def _activate_system_keyring(kr) -> None:
 
 
 def _init_windows_backend():
-    """Windows Credential Manager via keyring's WinVaultKeyring.
+    """Windows Credential Manager via credstore's single-target backend.
 
-    This is the effective primary of the auto-discovery chain on Windows
-    (WinVaultKeyring 5.0 > cryptfile 2.5/0.6/0.5), so selecting it
-    explicitly is behavior-identical — just deterministic.
-    Returns None if construction fails (pywin32 missing, etc.).
+    ``WinVaultKeyring`` is deliberately not used: its bare-service target plus
+    ``{username}@{service}`` overflow exists only to keep legacy stores
+    readable, while credstore writes one ``{service}:{username}`` target on
+    both Windows and WSL (see ``credstore._target``).
+
+    Returns None if the Windows bindings are unavailable, which enables the
+    environment fallback.
     """
     try:
-        from keyring.backends.Windows import WinVaultKeyring
+        from credstore._win_backend import WinBackend
 
-        kr = WinVaultKeyring()
+        kr = WinBackend()
     except Exception as exc:  # noqa: BLE001 — any failure enables the environment fallback
         logger.warning("Windows system keyring unavailable: %s", exc)
         return None
-    logger.debug("system keyring: WinVaultKeyring (deterministic)")
+    logger.debug("system keyring: WinBackend (deterministic)")
     return kr
 
 

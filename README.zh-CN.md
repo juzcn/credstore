@@ -242,13 +242,24 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 
 | 平台 | 后端 | 机制 |
 |------|------|------|
-| **Windows** | `WinVaultKeyring` | Windows 凭据管理器（Vault API，由 keyring 提供） |
-| **WSL** | `WslBackend` | PowerShell → advapi32.dll CredReadW/CredWriteW（C# P/Invoke）——与 Windows 共享同一 CredMan 存储 |
+| **Windows** | `WinBackend` | Windows 凭据管理器，每条凭据一个 `{service}:{key}` 目标（pywin32-ctypes） |
+| **WSL** | `WslBackend` | PowerShell → advapi32.dll CredReadW/CredWriteW（C# P/Invoke）——与 Windows 同一存储、同一目标格式 |
 | **macOS**（GUI） | `macOS.Keyring` | macOS 登录钥匙串 |
 | **macOS**（无头） | `macOS.Keyring` + 隔离钥匙串 | `CREDSTORE_KEYCHAIN`（或 `~/.credstore/credentials.keychain-db`）；首次使用时自动通过 `security create-keychain` 创建 |
 | **Linux** | `KeyutilsBackend` | 内核持久化 keyring（`@p`），通过 `add_key`/`keyctl` 系统调用（ctypes，零额外依赖） |
 
 `WslBackend`（优先级 9.5）和 `KeyutilsBackend`（优先级 1.5）也注册为标准 `keyring.backends` 入口点，因此对外部消费方会正确参与 keyring 自身的优先级链——但 credstore 自身的分发是直接选定它们，从不靠发现。
+
+### 凭据布局
+
+在 Windows 和 WSL 上，每条凭据是凭据管理器中的一个 generic credential：
+
+```
+TargetName = "{service}:{key}"
+UserName   = key
+```
+
+凭据管理器仅以 `TargetName` 识别 generic credential——`UserName` 只是元数据，API 会忽略它——因此每个 key 必须有自己的 target。`{service}:{key}` 是 `keyring_wincred` 和 `go-keyring` 采用的组合方式。Windows 与 WSL 只写这一种形态，没有回退条目或溢出条目：任一侧写入的凭据，另一侧读到的就是同一条。
 
 ### 双写流程
 
@@ -279,7 +290,7 @@ credstore.get_backend_name()        # → "system keyring + cryptfile (dual-writ
 
 在 WSL 上，没有可用的 Linux 桌面密钥链。`WslBackend` 通过调用 `powershell.exe` 并嵌入 C# 代码 P/Invoke `advapi32.dll`（`CredReadW`、`CredWriteW`、`CredDeleteW`）来桥接 Windows 凭据管理器。由于直接对接 CredMan，WSL 与原生 Windows 共享同一凭据存储——任一侧 `credstore set` 的数据另一侧都能读到。
 
-存储布局与 keyring 的 `WinVaultKeyring` 完全一致：凭据的 `UserName` 就是 key，最后写入的条目占据 service 目标，被挤出的用户名移到 `{username}@{service}`。读取时先查 service 目标，再查复合目标——两个平台使用同一批条目、同一顺序。与平台自动发现不同，`WslBackend` 被确定性地选中（无优先级竞争）。
+每条凭据是一个 generic credential，`TargetName = {service}:{key}`，`UserName = key`——与 Windows 后端写入的单一目标完全相同。凭据管理器仅以 TargetName 识别 generic credential，因此每个 key 都有自己的条目，不存在主条目/溢出条目之分。与平台自动发现不同，`WslBackend` 被确定性地选中（无优先级竞争）。
 
 ### Keyutils 后端
 
@@ -312,7 +323,7 @@ macOS 在 GUI 会话中使用 `keyring.backends.macOS.Keyring`（登录钥匙串
 | **WSL** | `powershell.exe` + 嵌入式 C# `CredEnumerateW` 通过 `advapi32.dll` |
 | **其他** | 不支持——列表使用环境变量回退及 cryptfile 中的 key 名称 |
 
-枚举仅获取 key 名称——永远不会批量加载密钥值。在 WSL 上，除非确实需要取值，PowerShell 桥接层根本不会去读取凭据 blob，因此列取操作不会把密钥从凭据管理器里搬出来。同步比对时逐个取值并立即丢弃。同一用户名在 service 目标和复合目标下都有条目时，service 副本才是当前值，枚举报告它。
+枚举仅获取 key 名称——永远不会批量加载密钥值。在 WSL 上，除非确实需要取值，PowerShell 桥接层根本不会去读取凭据 blob，因此列取操作不会把密钥从凭据管理器里搬出来。同步比对时逐个取值并立即丢弃。只列取 `{service}:{key}` 形式的条目，其他应用写入的凭据不会被触碰。
 
 ## 开发
 

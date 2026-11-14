@@ -25,18 +25,18 @@ class TestGetSystemKeyring:
     # ── deterministic dispatch ──────────────────────────────────────
 
     def test_dispatch_windows(self, monkeypatch):
-        """Native Windows → WinVaultKeyring."""
+        """Native Windows → credstore's single-target WinBackend."""
         monkeypatch.setattr(backend, "is_wsl", lambda: False)
         monkeypatch.setattr(backend.os, "name", "nt")
         monkeypatch.setattr(backend.sys, "platform", "win32")
         mock_kr = MagicMock()
         mock_mod = MagicMock()
-        mock_mod.WinVaultKeyring = MagicMock(return_value=mock_kr)
+        mock_mod.WinBackend = MagicMock(return_value=mock_kr)
         with patch.dict(
             "sys.modules",
             {
                 "keyring": MagicMock(),
-                "keyring.backends.Windows": mock_mod,
+                "credstore._win_backend": mock_mod,
             },
         ):
             assert backend._init_system() is mock_kr

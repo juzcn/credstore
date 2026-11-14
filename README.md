@@ -285,13 +285,24 @@ Backend selection is **deterministic by platform** — no keyring auto-discovery
 
 | Platform | Backend | Mechanism |
 |----------|---------|-----------|
-| **Windows** | `WinVaultKeyring` | Windows Credential Manager (Vault API, via keyring) |
-| **WSL** | `WslBackend` | PowerShell → advapi32.dll CredReadW/CredWriteW (C# P/Invoke) — same CredMan store as Windows |
+| **Windows** | `WinBackend` | Windows Credential Manager, one `{service}:{key}` target per credential (pywin32-ctypes) |
+| **WSL** | `WslBackend` | PowerShell → advapi32.dll CredReadW/CredWriteW (C# P/Invoke) — same store and target format as Windows |
 | **macOS** (GUI) | `macOS.Keyring` | macOS login keychain |
 | **macOS** (headless) | `macOS.Keyring` + isolated keychain | `CREDSTORE_KEYCHAIN` (or `~/.credstore/credentials.keychain-db`); auto-created via `security create-keychain` |
 | **Linux** | `KeyutilsBackend` | Kernel persistent keyring (`@p`) via `add_key`/`keyctl` syscalls (ctypes, zero extra deps) |
 
 `WslBackend` (priority 9.5) and `KeyutilsBackend` (priority 1.5) are also registered as standard `keyring.backends` entry points, so they participate correctly in keyring's own priority chain for external consumers — but credstore's own dispatch selects them directly, never by discovery.
+
+### Credential Layout
+
+On Windows and WSL every credential is one generic credential in Credential Manager:
+
+```
+TargetName = "{service}:{key}"
+UserName   = key
+```
+
+Credential Manager identifies a generic credential by `TargetName` alone — the `UserName` field is metadata and is ignored by the API — so each key needs a distinct target. `{service}:{key}` is the composition used by `keyring_wincred` and `go-keyring`. Windows and WSL write exactly this one shape, with no fallback or overflow entries: a credential set from either side is the same entry the other side reads.
 
 ### Dual-Write Flow
 
@@ -322,7 +333,7 @@ Backend selection is **deterministic by platform** — no keyring auto-discovery
 
 On WSL, no Linux desktop keyring is available. `WslBackend` bridges to Windows Credential Manager by calling `powershell.exe` with embedded C# that P/Invokes `advapi32.dll` (`CredReadW`, `CredWriteW`, `CredDeleteW`). Because it targets CredMan directly, WSL and native Windows share the same credential store — `credstore set` on either side is visible on the other.
 
-The storage layout is exactly keyring's `WinVaultKeyring` layout: the credential's `UserName` is the key, the entry that owns the service target is the one written last, and each displaced username is moved to `{username}@{service}`. Reads try the service target first and the compound target second — the same entries in the same order on both platforms. Unlike platform auto-discovery, `WslBackend` is selected deterministically (no priority roulette).
+Every credential is one generic credential with `TargetName = {service}:{key}` and `UserName = key` — the same single target the Windows backend writes. Credential Manager keys a generic credential by TargetName alone, so each key gets its own entry; there is no main/overflow pair to resolve. Unlike platform auto-discovery, `WslBackend` is selected deterministically (no priority roulette).
 
 ### Keyutils Backend
 
@@ -369,7 +380,7 @@ macOS uses `keyring.backends.macOS.Keyring` (the login keychain) in GUI sessions
 | **WSL** | `powershell.exe` + inline C# `CredEnumerateW` via `advapi32.dll` |
 | **Other** | Unsupported — the listing uses the environment fallback and the cryptfile's key names |
 
-Enumeration retrieves key names only — secret values are never batch-loaded. On WSL the PowerShell bridge is told not to read the credential blobs at all unless values are actually wanted, so a listing never moves secrets out of Credential Manager. Sync comparison fetches one value at a time and immediately discards it. Where one username has both a service-target entry and a compound-target entry, the service copy is the live one and is the one reported.
+Enumeration retrieves key names only — secret values are never batch-loaded. On WSL the PowerShell bridge is told not to read the credential blobs at all unless values are actually wanted, so a listing never moves secrets out of Credential Manager. Sync comparison fetches one value at a time and immediately discards it. Only targets of the form `{service}:{key}` are listed; credentials written by other applications are never touched.
 
 ## Development
 

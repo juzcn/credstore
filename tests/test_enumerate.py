@@ -15,7 +15,7 @@ from credstore._enumerate import enumerate_system_keyring
 def _make_mock_cred(**overrides):
     """Build a mock Windows credential dict."""
     return {
-        "TargetName": "credstore",
+        "TargetName": "credstore:testuser",
         "Type": 1,  # CRED_TYPE_GENERIC
         "UserName": "testuser",
         "CredentialBlob": "test".encode("utf-16-le"),
@@ -150,9 +150,9 @@ class TestEnumerateWindows:
 
         assert result == []
 
-    def test_skips_empty_username(self):
-        """Credentials with empty UserName are skipped."""
-        cred = _make_mock_cred(UserName="")
+    def test_skips_empty_key(self):
+        """A bare ``service:`` target carries no key and is skipped."""
+        cred = _make_mock_cred(TargetName="credstore:")
         mock_wc = _mock_win32cred_module(creds=[cred])
         mock_pywin32 = MagicMock()
         mock_pywin32.win32cred = mock_wc
@@ -164,12 +164,13 @@ class TestEnumerateWindows:
 
         assert result == []
 
-    def test_filters_by_service_name(self):
-        """Only TargetName == service or endswith @service."""
-        m1 = _make_mock_cred(TargetName="myservice", UserName="u1")
-        m2 = _make_mock_cred(TargetName="u@myservice", UserName="u2")
-        nm = _make_mock_cred(TargetName="other", UserName="u3")
-        mock_wc = _mock_win32cred_module(creds=[m1, m2, nm])
+    def test_filters_by_service_prefix(self):
+        """Only ``{service}:{key}`` targets match; old layouts are foreign."""
+        m1 = _make_mock_cred(TargetName="myservice:u1", UserName="u1")
+        m2 = _make_mock_cred(TargetName="u2@myservice", UserName="u2")
+        m3 = _make_mock_cred(TargetName="myservice", UserName="u3")
+        nm = _make_mock_cred(TargetName="other:u4", UserName="u4")
+        mock_wc = _mock_win32cred_module(creds=[m1, m2, m3, nm])
         mock_pywin32 = MagicMock()
         mock_pywin32.win32cred = mock_wc
 
@@ -178,16 +179,14 @@ class TestEnumerateWindows:
 
             result = _enumerate_windows("myservice")
 
-        assert len(result) == 2
-        assert result[0][0] == "u1"
-        assert result[1][0] == "u2"
+        assert result == [("u1", "")]
 
-    def test_dedup_usernames(self):
-        """Duplicate usernames are removed (first wins)."""
-        c1 = _make_mock_cred(UserName="dup")
-        c2 = _make_mock_cred(UserName="dup")
-        c3 = _make_mock_cred(UserName="unique")
-        mock_wc = _mock_win32cred_module(creds=[c1, c2, c3])
+    def test_key_comes_from_target_not_username(self):
+        """The target is the identity; UserName is only metadata."""
+        cred = _make_mock_cred(
+            TargetName="credstore:real-key", UserName="metadata-account"
+        )
+        mock_wc = _mock_win32cred_module(creds=[cred])
         mock_pywin32 = MagicMock()
         mock_pywin32.win32cred = mock_wc
 
@@ -196,30 +195,14 @@ class TestEnumerateWindows:
 
             result = _enumerate_windows("credstore")
 
-        assert len(result) == 2
-        usernames = [u for u, _ in result]
-        assert usernames == ["dup", "unique"]
+        assert result == [("real-key", "")]
 
-    @pytest.mark.parametrize("service_first", [False, True])
-    def test_service_target_wins_over_compound_for_same_username(self, service_first):
-        """The service copy is the live one after an update.
-
-        WinVaultKeyring moves the old value to ``{username}@service`` and
-        writes the new value under the service target.  Enumeration must
-        report the new value regardless of the order CredEnumerate lists
-        the two entries in.
-        """
-        stale = _make_mock_cred(
-            TargetName="dup@credstore",
-            UserName="dup",
-            CredentialBlob="old".encode("utf-16-le"),
-        )
-        current = _make_mock_cred(
-            TargetName="credstore",
-            UserName="dup",
-            CredentialBlob="new".encode("utf-16-le"),
-        )
-        creds = [current, stale] if service_first else [stale, current]
+    def test_reads_every_credstore_target(self):
+        """One target per credential — all of them are listed."""
+        creds = [
+            _make_mock_cred(TargetName="credstore:a", UserName="a"),
+            _make_mock_cred(TargetName="credstore:b", UserName="b"),
+        ]
         mock_wc = _mock_win32cred_module(creds=creds)
         mock_pywin32 = MagicMock()
         mock_pywin32.win32cred = mock_wc
@@ -227,9 +210,9 @@ class TestEnumerateWindows:
         with patch.dict("sys.modules", {"win32ctypes.pywin32": mock_pywin32}):
             from credstore._enumerate import _enumerate_windows
 
-            result = _enumerate_windows("credstore", with_values=True)
+            result = _enumerate_windows("credstore")
 
-        assert result == [("dup", "new")]
+        assert result == [("a", ""), ("b", "")]
 
     # ------------------------------------------------------------------
     # Keys-only
