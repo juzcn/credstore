@@ -96,7 +96,7 @@ by trying the spellings that could have produced the stored name:
 | `get KEY -p` | prompted | Dual-query primary store + cryptfile, plaintext. Fails on mismatch |
 | `remove KEY` | prompted² | Remove from both stores (best-effort) |
 | `copy SOURCE DEST` | required¹ | Idempotent copy (primary store + cryptfile; both must already match). Re-injects dest to env if previously injected |
-| *(no command)* | prompted³ | Triple-read: primary store + cryptfile + env. Shows sync status per key |
+| *(no command)* | prompted³ | Triple-read: primary store + cryptfile + env. Compares both copies against the backup |
 | `inject KEY… [--shell]` | — ³ | Persist to system env: registry (Win) or shell profile (Unix). Reads the primary store; falls back to the backup only when the key is missing there (prompts master pw) |
 | `uninject KEY… [--shell]` | — | Remove from system env (in fallback mode, from the environment store too) |
 | `reset-keyring` | prompted | Restore all from cryptfile → system keyring (disaster recovery) |
@@ -181,18 +181,25 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — activate
   KEY                  SYSTEM KEYRING   CRYPTFILE        ENV    STATUS
   ────────             ──────────────   ──────────────   ────   ──────
   ANTHROPIC_API_KEY    ✔                ✔                —      synced
-  DEEPSEEK_API_KEY     ✔                ✔                ✔      synced
+  DEEPSEEK_API_KEY     ✔                ✔                ≠      MISMATCH ⚠
   OPENAI_API_KEY       —                ✔                —      cryptfile only
   ────────             ──────────────   ──────────────   ────   ──────
-  3 credential(s) — synced: 2, cryptfile only: 1, env: 1
+  3 credential(s) — synced: 1, cryptfile only: 1, mismatched: 1, env: 1
 ```
+
+The encrypted backup is the reference: every other copy is compared with its
+value. A key with no readable backup copy (no backup yet, or no entry for that
+key) falls back to the primary store — the keyring, or the environment in
+fallback mode — as the reference instead.
 
 | Column | Meaning |
 |--------|---------|
-| `SYSTEM KEYRING` | ✔ = stored in OS keyring; `?` = this platform cannot list the keyring |
-| `CRYPTFILE` | ✔ = stored in encrypted backup |
-| `ENV` | ✔ = currently set as environment variable |
-| `STATUS` | `synced`, `keyring only`, `cryptfile only`, `MISMATCH ⚠`, or `in backup` (`?` keyring — nothing can be compared) |
+| `SYSTEM KEYRING` | ✔ = stored in the OS keyring and matches the reference; `≠` = stored but differs; `—` = absent; `?` = this platform cannot list the keyring |
+| `CRYPTFILE` | ✔ = stored in the encrypted backup (the reference when readable); `?` = present but sealed under another spelling |
+| `ENV` | ✔ = set and matches the reference; `≠` = set but differs; `—` = not set |
+| `STATUS` | `synced`, `keyring only`, `cryptfile only`, `MISMATCH ⚠` (a present copy differs from the reference), or `in backup` (`?` keyring — nothing can be compared) |
+
+An absent copy stays `—`; only a copy that is present and differs is `≠`.
 
 In **environment-fallback** mode the first column is labelled `ENV FALLBACK`
 and lists the environment copies; statuses and tips refer to it instead of the

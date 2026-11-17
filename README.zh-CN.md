@@ -80,7 +80,7 @@ key 在两个存储中都是**区分大小写**的。加密文件里则不然：
 | `get KEY -p` | 询问 | 双查询主存储 + cryptfile，明文输出。不一致时报错 |
 | `remove KEY` | 询问² | 从两个存储中删除（尽力而为） |
 | `copy SOURCE DEST` | 必需¹ | 幂等复制（主存储 + cryptfile，两者都已一致才算幂等）。若目标已注入环境变量则自动重新注入 |
-| *（无命令）* | 询问³ | 三重读取：主存储 + cryptfile + 环境变量。显示每个 key 的同步状态 |
+| *（无命令）* | 询问³ | 三重读取：主存储 + cryptfile + 环境变量。两个副本都与真值比较 |
 | `inject KEY… [--shell]` | — ³ | 持久化到系统环境：注册表（Win）或 shell 配置文件（Unix）。读主存储；仅当主存储没有该 key 时才回退读取备份（询问主密码） |
 | `uninject KEY… [--shell]` | — | 从系统环境中移除（回退模式下同时从环境存储中移除） |
 | `reset-keyring` | 询问 | 从 cryptfile 恢复全部 → 系统密钥链（灾难恢复） |
@@ -143,18 +143,24 @@ Invoke-Expression (credstore inject DEEPSEEK_API_KEY)  # PowerShell — 立即�
   KEY                  SYSTEM KEYRING   CRYPTFILE        ENV    STATUS
   ────────             ──────────────   ──────────────   ────   ──────
   ANTHROPIC_API_KEY    ✔                ✔                —      synced
-  DEEPSEEK_API_KEY     ✔                ✔                ✔      synced
+  DEEPSEEK_API_KEY     ✔                ✔                ≠      MISMATCH ⚠
   OPENAI_API_KEY       —                ✔                —      cryptfile only
   ────────             ──────────────   ──────────────   ────   ──────
-  3 credential(s) — synced: 2, cryptfile only: 1, env: 1
+  3 credential(s) — synced: 1, cryptfile only: 1, mismatched: 1, env: 1
 ```
+
+加密备份是真值：其余每个副本都与它的值比较。某个 key 没有可读的备份副本
+（尚无备份，或备份中没有该 key）时，改以主存储——密钥链；环境回退模式下为
+环境——为真值。
 
 | 列 | 含义 |
 |----|------|
-| `SYSTEM KEYRING` | ✔ = 已存入 OS 密钥链；`?` = 本平台无法枚举密钥链 |
-| `CRYPTFILE` | ✔ = 已存入加密备份 |
-| `ENV` | ✔ = 当前已设为环境变量 |
-| `STATUS` | `synced`（已同步）、`keyring only`、`cryptfile only`、`MISMATCH ⚠`（不一致）或 `in backup`（密钥链为 `?`，无法比对） |
+| `SYSTEM KEYRING` | ✔ = 已存入 OS 密钥链且与真值一致；`≠` = 已存入但不一致；`—` = 不存在；`?` = 本平台无法枚举密钥链 |
+| `CRYPTFILE` | ✔ = 已存入加密备份（可读时即为真值）；`?` = 存在，但以另一种拼写封存 |
+| `ENV` | ✔ = 已设置且与真值一致；`≠` = 已设置但不一致；`—` = 未设置 |
+| `STATUS` | `synced`（已同步）、`keyring only`、`cryptfile only`、`MISMATCH ⚠`（某个存在的副本与真值不一致）或 `in backup`（密钥链为 `?`，无法比对） |
+
+缺省的副本仍显示 `—`；只有存在且不一致的副本才显示 `≠`。
 
 在**环境回退**模式下，第一列改标为 `ENV FALLBACK`，列出环境中的副本；状态与提示也改为针对环境存储。
 

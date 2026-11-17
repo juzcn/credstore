@@ -11,7 +11,7 @@ Commands::
     credstore get <key>           Retrieve (primary store only, masked)
     credstore remove <key>        Remove a credential
     credstore copy <src> <dst>    Copy a credential to a new key
-    credstore (no command)       List credentials (primary store + cryptfile + env)
+    credstore (no command)       List credentials and compare every copy with the backup
     credstore reset-keyring       Restore keyring from cryptfile backup
     credstore reset-env           Restore the environment fallback from cryptfile
     credstore reset-backup        Sync primary store → cryptfile backup
@@ -1080,9 +1080,11 @@ def _cmd_list() -> int:
     """List credentials from the primary store, cryptfile backup, and env vars.
 
     Triple-read: checks the primary store (system keyring, or the environment
-    fallback when no keyring is available), the cryptfile, and ``os.environ``
-    for each known credential key.  The ENV column shows whether the key is
-    currently set as an environment variable.
+    fallback when no keyring is available), the cryptfile, and the environment
+    for each known credential key.  The cryptfile is the reference — or the
+    primary store when the key has no readable backup copy — and the keyring
+    and ENV columns show whether their copy matches it (``✔``), differs from
+    it (``≠``), or is absent (``—``).
 
     Where the keyring cannot be enumerated (macOS, Linux) the keyring column
     is reported as unknown — the keys then come from the backup and the env,
@@ -1229,75 +1231,112 @@ def _classify_credential_row(
     key: str,
     in_ring: bool,
     in_crypt: bool,
+    in_env: bool,
     cf_ctx,  # unlocked cryptfile or None
     enumerable: bool = True,
     env_primary: bool = False,
 ):
     """Compare a single credential across stores and classify its sync status.
 
-    Returns ``(ring_mark, crypt_mark, status, delta)`` where *delta* is
-    one of ``("synced", "ring_only", "crypt_only", "mismatched", "unknown")``.
-    Caller updates aggregate counters from *delta*.
+    The encrypted backup is the reference: every other copy the row has
+    (system keyring, environment variable) is compared against its value.
+    When there is no readable backup copy — no backup yet, or no entry for
+    this key — the primary store (the keyring, or the environment fallback)
+    is the reference instead.
+
+    Returns ``(ring_mark, crypt_mark, env_mark, status, delta)``.  A mark is
+    ``✔`` when its copy is present and matches the reference, ``≠`` when it is
+    present but differs, ``—`` when it is absent, and ``?`` when it cannot be
+    inspected (the platform cannot list the keyring, or the backup entry is
+    sealed under another spelling).  *delta* is one of ``("synced",
+    "ring_only", "crypt_only", "mismatched", "unknown")``; the caller updates
+    aggregate counters from it.
 
     *enumerable* is False on platforms whose keyring has no list API (macOS,
-    Linux): membership there is unknowable, so no verdict about the pair can
-    be given.
+    Linux): membership there is unknowable, so the keyring column stays ``?``
+    and no verdict about the pair is given — an environment copy is still
+    compared where a reference value can be read.
 
     *env_primary* relabels the primary-store side: in environment-fallback
     mode the first column is the environment, not the keyring.
 
-    Memory-safe: retrieves at most one value per store, compares,
-    and ``del``-s immediately.
+    Memory-safe: retrieves at most one value per store, compares, and
+    ``del``-s immediately.
     """
     primary_only = "env only" if env_primary else "keyring only"
+
+    # Keyring copy first: with no readable backup it is the reference.  On a
+    # platform that cannot enumerate the keyring it is unknowable, so it is
+    # neither read nor claimed.
+    ring_present = False
+    ring_val: str | None = None
+    if in_ring and enumerable:
+        ring_val = store_mod.get_credential(key)
+        ring_present = ring_val is not None
+
+    # Backup copy — the preferred reference.  A ValueError means the entry is
+    # sealed under another spelling of the key and cannot be read back under
+    # this one; that is a divergence, which is what MISMATCH reports.
+    crypt_val: str | None = None
+    crypt_unreadable = False
+    if in_crypt and (in_ring or in_env) and cf_ctx is not None:
+        try:
+            crypt_val = cf_ctx.get_password(store_mod.DEFAULT_SERVICE, key)
+        except ValueError:
+            crypt_unreadable = True
+
+    # The backup is the truth; without a readable backup copy, the primary
+    # store is.
+    reference = crypt_val if crypt_val is not None else ring_val
+
+    ring_mark = "—"
+    if ring_present:
+        if crypt_val is None:
+            ring_mark = "✔"  # the reference (or nothing to compare against)
+        else:
+            ring_mark = "✔" if ring_val == crypt_val else "≠"
+
+    crypt_mark = "—"
+    if in_crypt:
+        crypt_mark = "?" if (crypt_unreadable and enumerable) else "✔"
+
+    # Environment copy.  A missing variable stays "—" (absent): absence is
+    # reported as absence, never as a mismatch.
+    env_mark = "—"
+    if in_env:
+        env_val = _envstore.get_secret(key)
+        if env_val is not None:
+            if reference is not None:
+                env_mark = "✔" if env_val == reference else "≠"
+            else:
+                env_mark = "✔"  # nothing to compare against — presence only
+        del env_val
+
     if not enumerable:
         # Nothing can be said about the keyring's side: it cannot be listed,
         # so "cryptfile only" — which is what every row used to say there —
         # would be a claim about a store nobody looked at, and it sent the
         # user to `reset-keyring` for credentials that were never missing.
-        return (
-            ("?", "✔", "in backup", "unknown")
-            if in_crypt
-            else ("?", "—", "unknown", "unknown")
-        )
-
-    if not (in_ring and in_crypt):
-        # Present in only one store — no comparison needed.  Neither can be
-        # "synced" here: that verdict needs a value from both stores.
-        return (
-            ("✔", "—", primary_only, "ring_only")
-            if in_ring
-            else ("—", "✔", "cryptfile only", "crypt_only")
-        )
-
-    ring_val = store_mod.get_credential(key)
-    try:
-        crypt_val = (
-            cf_ctx.get_password(store_mod.DEFAULT_SERVICE, key)
-            if cf_ctx is not None
-            else None
-        )
-    except ValueError:
-        # The key IS in cryptfile_keys, so the entry exists — but it is sealed
-        # under a different spelling of the key, and the value cannot be read
-        # back under this one.  That is a divergence between the two stores,
-        # which is what MISMATCH reports; "reset-backup" resolves it by
-        # rewriting the entry under the keyring's spelling.  Return instead of
-        # raising so one such entry cannot abort the whole listing.
-        del ring_val
-        return ("✔", "✔", "MISMATCH ⚠", "mismatched")
-
-    if ring_val is not None and crypt_val is not None:
-        if ring_val == crypt_val:
-            result = ("✔", "✔", "synced", "synced")
+        # A divergent environment copy is still verifiable.
+        if env_mark == "≠":
+            status, delta = "MISMATCH ⚠", "mismatched"
+        elif in_crypt:
+            status, delta = "in backup", "unknown"
         else:
-            result = ("✔", "✔", "MISMATCH ⚠", "mismatched")
-        del crypt_val
-    elif ring_val is not None:
-        result = ("✔", "—", primary_only, "ring_only")
+            status, delta = "unknown", "unknown"
+        result = ("?", crypt_mark, env_mark, status, delta)
+    elif crypt_unreadable or env_mark == "≠" or ring_mark == "≠":
+        result = (ring_mark, crypt_mark, env_mark, "MISMATCH ⚠", "mismatched")
+    elif ring_present:
+        result = (
+            (ring_mark, crypt_mark, env_mark, "synced", "synced")
+            if crypt_val is not None
+            else (ring_mark, crypt_mark, env_mark, primary_only, "ring_only")
+        )
     else:
-        result = ("—", "✔", "cryptfile only", "crypt_only")
+        result = (ring_mark, crypt_mark, env_mark, "cryptfile only", "crypt_only")
 
+    del crypt_val
     del ring_val
     return result
 
@@ -1314,9 +1353,12 @@ def _print_credential_table_safe(
 ) -> None:
     """Print a formatted table of credentials with sync status.
 
-    Shows four columns: KEY, primary store (SYSTEM KEYRING, or ENV FALLBACK),
-    CRYPTFILE, ENV, STATUS.  *enumerable* False (macOS, Linux) leaves the
-    keyring column unknown — see ``_classify_credential_row``.
+    Shows five columns: KEY, primary store (SYSTEM KEYRING, or ENV FALLBACK),
+    CRYPTFILE, ENV, STATUS.  CRYPTFILE is the reference — or the primary
+    store for a key without a readable backup copy — and the other columns
+    say whether their copy matches it.  *enumerable* False (macOS,
+    Linux) leaves the keyring column unknown — see
+    ``_classify_credential_row``.
     Memory-safe: retrieves values ONE at a time for comparison.
     """
     key_width = max(len(k) for k in all_keys) + 2
@@ -1345,14 +1387,14 @@ def _print_credential_table_safe(
         in_ring = key in keyring_keys
         in_crypt = key.upper() in crypt_upper
         in_env = key in env_keys
-        env_mark = "✔" if in_env else "—"
         if in_env:
             counts["env_set"] += 1
 
-        ring_mark, crypt_mark, status, delta = _classify_credential_row(
+        ring_mark, crypt_mark, env_mark, status, delta = _classify_credential_row(
             key,
             in_ring,
             in_crypt,
+            in_env,
             cf_ctx,
             enumerable,
             env_primary,

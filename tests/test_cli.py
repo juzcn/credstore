@@ -728,21 +728,24 @@ class TestCliCopy:
 
 @pytest.mark.usefixtures("_tty")
 class TestCliList:
-    def test_unreadable_backup_entry_is_a_mismatch_not_a_crash(self):
+    def test_unreadable_backup_entry_is_a_mismatch_not_a_crash(self, monkeypatch):
         """A backup entry sealed under an unrecoverable spelling cannot abort
         the whole listing.
 
         The key is present in cryptfile_keys, so the row has to say something
-        about it: the two stores have diverged (that entry is unreachable
-        under the keyring's name), which is what MISMATCH reports.
+        about it: the entry is unreachable under the keyring's name, which is
+        what MISMATCH reports.  The keyring copy remains the reference.
         """
 
         class _UnreadableCryptfile:
             def get_password(self, service, username):
                 raise ValueError("MAC check failed")
 
-        marks = _classify_credential_row("KEY", True, True, _UnreadableCryptfile())
-        assert marks == ("✔", "✔", "MISMATCH ⚠", "mismatched")
+        monkeypatch.setattr("credstore._store.get_credential", lambda key: "ring-value")
+        marks = _classify_credential_row(
+            "KEY", True, True, False, _UnreadableCryptfile()
+        )
+        assert marks == ("✔", "?", "—", "MISMATCH ⚠", "mismatched")
 
     def test_list_empty(self, capsys, mock_backend, in_mem_cryptfile, monkeypatch):
         monkeypatch.setattr(
@@ -816,6 +819,9 @@ class TestCliList:
         out = capsys.readouterr().out
         assert "synced" in out
         assert "1 credential" in out
+        # There is nothing to compare the environment against here, so the
+        # absent ENV copy is reported as absent, not as a mismatch.
+        assert "≠" not in out
 
     def test_list_with_mismatched_keys(
         self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
@@ -834,6 +840,124 @@ class TestCliList:
         assert main([]) == 0
         out = capsys.readouterr().out
         assert "MISMATCH" in out
+        # The keyring column says which side diverged.
+        assert "≠" in out
+
+    def _list_with_env(self, capsys, monkeypatch, env: dict, *, enumerated=True):
+        """Run the bare listing, routing the env store at *env*."""
+        monkeypatch.setattr(
+            "credstore.__main__._enumerate_system_keyring",
+            lambda service, with_values=False: [("svc/k1", "")],
+        )
+        monkeypatch.setattr(
+            "credstore.__main__.enumeration_supported", lambda: enumerated
+        )
+        monkeypatch.setattr("credstore._envstore.has_secret", lambda k: k in env)
+        monkeypatch.setattr("credstore._envstore.get_secret", env.get)
+        monkeypatch.setattr(
+            "credstore.__main__.masked_input", lambda prompt="": "master-pw"
+        )
+        assert main([]) == 0
+        return capsys.readouterr().out
+
+    def test_list_env_value_compared_with_backup(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """A stale exported variable is reported as a mismatch.
+
+        The environment copy is what a child process reads, and it wins over
+        the keyring — a bare ✔ for "set" hid exactly the shadowing that
+        breaks the consumer.
+        """
+        in_mem_store["svc/k1"] = "same"
+        in_mem_cryptfile["svc/k1"] = "same"
+        out = self._list_with_env(capsys, monkeypatch, {"svc/k1": "stale"})
+        assert "MISMATCH" in out
+        assert "≠" in out
+        assert "synced" not in out
+
+    def test_list_env_matching_backup_is_synced(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """ENV ✔ now means "matches the backup", so equal values are synced."""
+        in_mem_store["svc/k1"] = "truth"
+        in_mem_cryptfile["svc/k1"] = "truth"
+        out = self._list_with_env(capsys, monkeypatch, {"svc/k1": "truth"})
+        assert "synced" in out
+        assert "≠" not in out
+
+    def test_list_env_absent_is_absent_not_mismatch(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """An unset variable stays "—": absence is reported as absence."""
+        in_mem_store["svc/k1"] = "truth"
+        in_mem_cryptfile["svc/k1"] = "truth"
+        out = self._list_with_env(capsys, monkeypatch, {})
+        assert "synced" in out
+        assert "≠" not in out
+
+    def test_list_keyring_value_compared_with_backup(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """A divergent keyring copy marks the keyring column, not just STATUS."""
+        in_mem_store["svc/k1"] = "stale"
+        in_mem_cryptfile["svc/k1"] = "truth"
+        out = self._list_with_env(capsys, monkeypatch, {"svc/k1": "truth"})
+        assert "MISMATCH" in out
+        assert "≠" in out
+
+    def test_list_without_backup_compares_env_with_keyring(
+        self, capsys, mock_backend_locked, in_mem_store, monkeypatch
+    ):
+        """No readable backup: the keyring value is the reference.
+
+        The keyring is what `reset-backup` will write from, so a stale
+        environment copy is measured against it.
+        """
+        in_mem_store["svc/k1"] = "truth"
+        monkeypatch.setattr(
+            "credstore.__main__._enumerate_system_keyring",
+            lambda service, with_values=False: [("svc/k1", "")],
+        )
+        monkeypatch.setattr("credstore._envstore.has_secret", lambda k: True)
+        monkeypatch.setattr("credstore._envstore.get_secret", lambda k: "stale")
+        assert main([]) == 0
+        out = capsys.readouterr().out
+        assert "MISMATCH" in out
+        assert "≠" in out
+
+    def test_list_without_backup_env_matching_keyring_is_not_mismatch(
+        self, capsys, mock_backend_locked, in_mem_store, monkeypatch
+    ):
+        """Matching the keyring is enough when there is no backup to match."""
+        in_mem_store["svc/k1"] = "truth"
+        monkeypatch.setattr(
+            "credstore.__main__._enumerate_system_keyring",
+            lambda service, with_values=False: [("svc/k1", "")],
+        )
+        monkeypatch.setattr("credstore._envstore.has_secret", lambda k: True)
+        monkeypatch.setattr("credstore._envstore.get_secret", lambda k: "truth")
+        assert main([]) == 0
+        out = capsys.readouterr().out
+        assert "MISMATCH" not in out
+        assert "≠" not in out
+        assert "keyring only" in out
+
+    def test_list_without_keyring_enumeration_still_compares_env(
+        self, capsys, mock_backend, in_mem_store, in_mem_cryptfile, monkeypatch
+    ):
+        """macOS/Linux: the keyring is unknowable, the env copy is not.
+
+        The row keeps its "in backup" verdict for the keyring, but a stale
+        environment copy is still a verifiable mismatch and is reported.
+        """
+        in_mem_store["svc/k1"] = "truth"
+        in_mem_cryptfile["svc/k1"] = "truth"
+        out = self._list_with_env(
+            capsys, monkeypatch, {"svc/k1": "stale"}, enumerated=False
+        )
+        assert "MISMATCH" in out
+        assert "≠" in out
 
     def test_list_with_cryptfile_only(
         self, capsys, mock_backend, in_mem_cryptfile, monkeypatch
